@@ -1,0 +1,12 @@
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.6
+h3>=4.0          # h3 v4 API: latlng_to_cell, cell_to_parent
+pandas>=2.0
+numpy>=1.26
+sqlalchemy>=2.0
+geoalchemy2>=0.14
+psycopg2-binary>=2.9
+streamlit>=1.35
+matplotlib>=3.8
+pytest>=8.0

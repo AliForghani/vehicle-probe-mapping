@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: vehicle_probes_db
+    environment:
+      POSTGRES_DB:       probes
+      POSTGRES_USER:     probes
+      POSTGRES_PASSWORD: probes
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/create_tables.sql:/docker-entrypoint-initdb.d/01_create_tables.sql
+      - ./sql/create_indexes.sql:/docker-entrypoint-initdb.d/02_create_indexes.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U probes -d probes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
