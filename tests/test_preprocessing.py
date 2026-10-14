@@ -78,7 +78,9 @@ def test_impossible_speed_spike_removed():
     cleaned, removed = filter_gps_noise(pre, max_speed_kmh=250.0)
     assert len(removed) == 1
     assert len(cleaned) == 2
-    assert removed.iloc[0]["noise_reason"] == "unrealistic_speed_between_consecutive_fixes"
+    # A 250m jump in 1s is both an impossible speed AND a local trajectory outlier,
+    # so noise_reason may be "multiple_flags" — assert the speed flag specifically.
+    assert removed.iloc[0]["speed_spike_flag"] == True
 
 
 # ── filter_gps_noise: Test 2 — persistent cluster NOT removed ─────────────────
@@ -164,18 +166,18 @@ def test_single_isolated_local_outlier_removed():
     One point jumps 40m perpendicular to an otherwise straight trajectory.
     Its neighbours are on the straight line → isolated → should be removed.
     """
-    # Straight trajectory heading east along lat=38.886
-    # fix3 jumps ~40m north (≈ 0.00036 degrees lat)
+    # Straight trajectory heading east along lat=38.886.
+    # Steps of 0.00025 lon per 2s ≈ 21.6m/2s ≈ 39 km/h — well below the speed threshold.
+    # fix3 jumps ~40m north (≈ 0.00036 degrees lat); its neighbours stay on the line.
     rows = [
-        _row("V1", _t(0),  38.886,       -77.080),
-        _row("V1", _t(2),  38.886,       -77.078),
-        _row("V1", _t(4),  38.886,       -77.076),
-        _row("V1", _t(6),  38.886 + 0.00036, -77.074),  # outlier ~40m north
-        _row("V1", _t(8),  38.886,       -77.072),
-        _row("V1", _t(10), 38.886,       -77.070),
+        _row("V1", _t(0),  38.886,            -77.08000),
+        _row("V1", _t(2),  38.886,            -77.07975),
+        _row("V1", _t(4),  38.886,            -77.07950),
+        _row("V1", _t(6),  38.886 + 0.00036,  -77.07925),  # outlier ~40m north
+        _row("V1", _t(8),  38.886,            -77.07900),
+        _row("V1", _t(10), 38.886,            -77.07875),
     ]
     pre = _pre(rows)
-    # Use tight speed limit so speed test doesn't interfere (all speeds are low here)
     cleaned, removed = filter_gps_noise(
         pre, max_speed_kmh=250.0, local_outlier_threshold_m=30.0, max_time_gap_seconds=30.0
     )
