@@ -63,16 +63,22 @@ PostGIS: GPS point → geometry  → GiST index → efficient exact spatial quer
 
 ## Synthetic Data Scenario — Arlington VA
 
-### Existing mapped road
-A simplified segment of Wilson Blvd in Arlington VA (~2.4 km east-west).
+### Mapped road network
+Two roads:
+- **Wilson Blvd** — east-west, ~2.4 km (Courthouse → Ballston)
+- **N Courthouse Rd** — north-south, crosses Wilson Blvd near its midpoint
+
+The intersection creates a genuine map-matching ambiguity zone: GPS fixes near
+the crossing fall within the search radius of both roads. Nearest-road matching
+may snap to the wrong road there; HMM uses trajectory continuity to stay correct.
 
 ### Normal vehicle trajectories
-~80% of vehicles travel approximately along the mapped road with realistic
+~80% of vehicles travel approximately along Wilson Blvd with realistic
 GPS noise (σ ≈ 6 m by default).
 
 ### Candidate new road
-~20% of vehicles repeatedly travel along a **parallel path ~30 m north** of the
-mapped road. This path does **not exist** in the current road network, simulating
+~20% of vehicles repeatedly travel along a **parallel path ~30 m north** of
+Wilson Blvd. This path does **not exist** in the current road network, simulating
 a new lane, newly constructed road, or changed road geometry.
 
 > **Why 30 m?**  
@@ -87,12 +93,11 @@ a new lane, newly constructed road, or changed road geometry.
 
 ```
 vehicle-probe-mapping/
-├── app.py                 Streamlit dashboard
-├── run_demo.py            End-to-end demo (no database required)
+├── app.py                 Streamlit dashboard (entry point)
 ├── docker-compose.yml     PostGIS container
 ├── requirements.txt
 ├── src/
-│   ├── generate_data.py   Synthetic road + probe generation
+│   ├── generate_data.py   Synthetic road network + probe generation
 │   ├── preprocessing.py   GPS cleaning and derived fields
 │   ├── h3_indexing.py     H3 cell assignment and aggregation
 │   ├── database.py        PostGIS load/query helpers
@@ -104,29 +109,21 @@ vehicle-probe-mapping/
 │   ├── create_tables.sql
 │   ├── create_indexes.sql
 │   └── example_queries.sql
-├── tests/
-│   ├── test_preprocessing.py
-│   ├── test_h3.py
-│   ├── test_map_matching.py
-│   └── test_change_detection.py
-└── data/optional_sample_data/   Output figures from run_demo.py
+└── tests/
+    ├── test_preprocessing.py
+    ├── test_h3.py
+    ├── test_map_matching.py
+    └── test_change_detection.py
 ```
 
 ---
 
 ## How to Run
 
-### Quick demo (no database)
-
-```bash
-pip install -r requirements.txt
-python run_demo.py
-# Figures saved to data/optional_sample_data/
-```
-
 ### Streamlit dashboard
 
 ```bash
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
@@ -175,7 +172,7 @@ pytest tests/ -v
 | `add_h3_cells()` | h3_indexing | Assign H3 res 9/10/11 cell IDs |
 | `aggregate_by_h3()` | h3_indexing | Count obs/vehicles/speed per cell |
 | `query_nearby_probes()` | spatial_queries | ST_DWithin proximity query |
-| `calculate_road_residuals()` | change_detection | Distance to nearest road per obs |
+| `calculate_road_residuals()` | change_detection | Distance + nearest road ID per obs |
 | `detect_candidate_map_changes()` | change_detection | Multi-vehicle off-road aggregation |
 | `map_match_nearest()` | map_matching | Baseline nearest-road snap |
 | `map_match_trajectory()` | map_matching | HMM / Viterbi trajectory matching |
@@ -198,8 +195,12 @@ It is **not** a universal automotive standard.
 ## Map Matching
 
 ### Baseline: nearest road
-For each GPS point, find the geometrically closest road segment.
-Fast but fails near parallel roads, on-ramps, and intersections.
+For each GPS point independently, find the geometrically closest road segment.
+Fast but fails near intersections — a fix near the Wilson/Courthouse crossing
+may snap to the wrong road because both are within the search radius.
+
+The dashboard (Tab 4) shows this failure directly: one fix snaps to N Courthouse Rd
+(red snap line) instead of staying on Wilson Blvd.
 
 ### HMM / Viterbi trajectory-aware matching
 
