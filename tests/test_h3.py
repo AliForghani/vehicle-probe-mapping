@@ -27,13 +27,14 @@ def test_parent_resolution_is_coarser():
     assert h3.get_resolution(cell_9)  == 9
 
 
-def test_parent_hierarchy_consistent():
-    """The res-10 parent of cell_11 must equal parent of cell_10."""
-    cell_11 = latlng_to_h3(38.886, -77.070, 11)
-    cell_10_direct  = cell_to_parent(cell_11, 10)
-    cell_9_via_11   = cell_to_parent(cell_11, 9)
-    cell_9_via_10   = cell_to_parent(cell_10_direct, 9)
-    assert cell_9_via_11 == cell_9_via_10
+def test_add_h3_cells_res9_matches_res10_parent():
+    df = pd.DataFrame([{"vehicle_id": "V001", "latitude": 38.886, "longitude": -77.070, "speed": 40.0}])
+    out = add_h3_cells(df)
+    
+    # Verify res9 was derived from res10 (your code), not some other path
+    expected_res9 = h3.cell_to_parent(out["h3_cell_res10"].iloc[0], 9)
+    assert out["h3_cell_res9"].iloc[0] == expected_res9
+
 
 
 def test_add_h3_cells_adds_columns():

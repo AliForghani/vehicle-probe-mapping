@@ -89,11 +89,21 @@ def plot_map_matching(
     roads_gdf: gpd.GeoDataFrame,
     vehicle_id: Optional[str] = None,
 ) -> plt.Figure:
-    """Map 4: one vehicle trajectory with nearest-road snap points."""
+    """Map 4: one vehicle trajectory with nearest-road snap points.
+
+    Draws all mapped roads so the intersection ambiguity zone is visible.
+    Snap lines are coloured by which road was matched:
+      - green  = Wilson Blvd (correct for east-west vehicle)
+      - red    = cross street (likely a mismatch near the intersection)
+    """
     fig, ax = plt.subplots(figsize=(12, 5))
-    for geom in roads_gdf.geometry:
+
+    # Draw each road with a distinct colour and label
+    road_colors = ["black", "#888888"]
+    for i, (geom, name) in enumerate(zip(roads_gdf.geometry, roads_gdf["road_name"])):
         xs, ys = geom.xy
-        ax.plot(xs, ys, "k-", linewidth=3, zorder=3, label="Mapped road")
+        ax.plot(xs, ys, color=road_colors[i % len(road_colors)],
+                linewidth=3, zorder=3, label=name)
 
     if vehicle_id is None:
         vehicle_id = vehicle_df["vehicle_id"].iloc[0]
@@ -106,20 +116,92 @@ def plot_map_matching(
         subset=["matched_lon", "matched_lat"]
     )
     ax.scatter(vm["matched_lon"], vm["matched_lat"],
-               s=15, c="orange", zorder=4, label="Snapped (nearest road)")
+               s=15, c="orange", zorder=4, label="Snapped position (nearest road)")
 
-    # Draw snap lines
+    # Snap lines: red if snapped to cross street (road_id != 1), green otherwise
+    wilson_road_id = roads_gdf[roads_gdf["road_name"].str.contains("Wilson")]["road_id"].iloc[0]
     for _, row in vm.iterrows():
         orig_row = veh[veh["timestamp"] == row["timestamp"]]
-        if not orig_row.empty:
-            ax.plot(
-                [orig_row.iloc[0]["longitude"], row["matched_lon"]],
-                [orig_row.iloc[0]["latitude"], row["matched_lat"]],
-                "g-", alpha=0.3, linewidth=0.8,
-            )
+        if orig_row.empty:
+            continue
+        snapped_to_cross = (row.get("matched_road_id") != wilson_road_id)
+        color = "#E84C4C" if snapped_to_cross else "#2ECC71"
+        ax.plot(
+            [orig_row.iloc[0]["longitude"], row["matched_lon"]],
+            [orig_row.iloc[0]["latitude"],  row["matched_lat"]],
+            color=color, alpha=0.5, linewidth=1.0,
+        )
 
-    ax.set_title(f"Map Matching — Vehicle {vehicle_id}", fontsize=13)
-    ax.legend(fontsize=9)
+    # Legend entries for snap line colours
+    ax.plot([], [], color="#2ECC71", linewidth=1.5, label="Snap → Wilson Blvd (correct)")
+    ax.plot([], [], color="#E84C4C", linewidth=1.5, label="Snap → cross street (mismatch)")
+
+    ax.set_title(
+        f"Map Matching — Vehicle {vehicle_id}  "
+        f"(red snap lines = nearest-road error near intersection)",
+        fontsize=11,
+    )
+    ax.legend(fontsize=8, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
+def plot_hmm_matching(
+    vehicle_df: pd.DataFrame,
+    hmm_df: pd.DataFrame,
+    roads_gdf: gpd.GeoDataFrame,
+    vehicle_id: Optional[str] = None,
+) -> plt.Figure:
+    """Map 4b: same vehicle trajectory snapped by HMM / Viterbi.
+
+    Uses hmm_matched_* columns from map_match_trajectory().
+    Snap lines are coloured the same way as plot_map_matching:
+      green  = Wilson Blvd (correct)
+      red    = cross street (mismatch — should be rare with HMM)
+    """
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    road_colors = ["black", "#888888"]
+    for i, (geom, name) in enumerate(zip(roads_gdf.geometry, roads_gdf["road_name"])):
+        xs, ys = geom.xy
+        ax.plot(xs, ys, color=road_colors[i % len(road_colors)],
+                linewidth=3, zorder=3, label=name)
+
+    if vehicle_id is None:
+        vehicle_id = vehicle_df["vehicle_id"].iloc[0]
+
+    veh = vehicle_df[vehicle_df["vehicle_id"] == vehicle_id].sort_values("timestamp")
+    ax.plot(veh["longitude"], veh["latitude"], "b.-", alpha=0.6,
+            markersize=5, linewidth=1, label="Raw GPS trajectory")
+
+    vm = hmm_df[hmm_df["vehicle_id"] == vehicle_id].dropna(
+        subset=["hmm_matched_lon", "hmm_matched_lat"]
+    )
+    ax.scatter(vm["hmm_matched_lon"], vm["hmm_matched_lat"],
+               s=15, c="orange", zorder=4, label="Snapped position (HMM)")
+
+    wilson_road_id = roads_gdf[roads_gdf["road_name"].str.contains("Wilson")]["road_id"].iloc[0]
+    for _, row in vm.iterrows():
+        orig_row = veh[veh["timestamp"] == row["timestamp"]]
+        if orig_row.empty:
+            continue
+        snapped_to_cross = (row.get("hmm_matched_road_id") != wilson_road_id)
+        color = "#E84C4C" if snapped_to_cross else "#2ECC71"
+        ax.plot(
+            [orig_row.iloc[0]["longitude"], row["hmm_matched_lon"]],
+            [orig_row.iloc[0]["latitude"],  row["hmm_matched_lat"]],
+            color=color, alpha=0.5, linewidth=1.0,
+        )
+
+    ax.plot([], [], color="#2ECC71", linewidth=1.5, label="Snap → Wilson Blvd (correct)")
+    ax.plot([], [], color="#E84C4C", linewidth=1.5, label="Snap → cross street (mismatch)")
+
+    ax.set_title(
+        f"HMM / Viterbi Matching — Vehicle {vehicle_id}  "
+        f"(trajectory-aware: fewer red snaps near intersection)",
+        fontsize=11,
+    )
+    ax.legend(fontsize=8, loc="upper left")
     fig.tight_layout()
     return fig
 

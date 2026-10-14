@@ -222,6 +222,50 @@ Viterbi selects the most-likely road SEQUENCE, not greedy best-per-point.
 
 ## GPS Noise vs Real Map Change
 
+### Two deliberately separate questions
+
+**GPS noise filtering** asks:
+> "Is this observation inconsistent with the **vehicle's own trajectory**?"
+
+Looks only at the vehicle's internal sequence — arrival speed, departure speed,
+perpendicular deviation from the local prev→next segment.
+Does **not** use distance from the road map.
+
+**Map-change detection** asks:
+> "Are many reliable vehicle trajectories consistently inconsistent with the **existing map**?"
+
+Uses road distance as the signal, after noise has already been removed.
+
+Keeping these separate prevents the noise filter from erasing the very evidence
+the change detector needs.  A vehicle consistently 30 m from the mapped road is
+noise-filtered first (trajectory-internally consistent → kept), then aggregated
+with other vehicles' trajectories to decide whether it represents a real change.
+
+### GPS noise filter: two tests
+
+**Test 1 — GPS speed outlier**
+
+An erroneous middle fix causes the calculated speed from the previous fix to it,
+and from it to the next fix, to become unrealistically high compared with the
+surrounding trajectory.
+
+A fix is flagged when:
+- speed from previous fix to current fix > threshold  AND
+- speed from current fix to next fix > threshold
+
+Requiring both conditions avoids removing a legitimate fix where only the speed
+from the previous fix is high (e.g. a long sampling gap after a fast road section).
+
+**Test 2 — isolated local trajectory outlier**
+```
+perpendicular distance from fix to prev→next segment > threshold
+AND neighbours are NOT similarly displaced  →  remove
+```
+Only applied when both time gaps to neighbours are small (configurable).
+If neighbours are also displaced, the fix is part of a persistent cluster → preserved.
+
+### Evidence strength
+
 ```
 one vehicle + one unusual fix        → likely GPS noise
 

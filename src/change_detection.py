@@ -35,20 +35,23 @@ def calculate_road_residuals(
     """
     df = df.copy()
 
-    road_geoms_utm = [
-        gpd.GeoDataFrame(geometry=[g], crs="EPSG:4326")
-        .to_crs("EPSG:32618")
-        .geometry.iloc[0]
-        for g in roads_gdf.geometry
-    ]
+    road_geoms_utm = list(roads_gdf.to_crs("EPSG:32618").geometry)
 
-    dists = []
+    road_ids   = list(roads_gdf["road_id"])
+    road_names = list(roads_gdf["road_name"])
+
+    dists, nearest_ids, nearest_names = [], [], []
     for row in df.itertuples():
         pt_utm = Point(_TO_UTM.transform(row.longitude, row.latitude))
-        min_dist = min(road_geom.distance(pt_utm) for road_geom in road_geoms_utm)
-        dists.append(round(min_dist, 2))
+        road_dists = [geom.distance(pt_utm) for geom in road_geoms_utm]
+        best = int(np.argmin(road_dists))
+        dists.append(round(road_dists[best], 2))
+        nearest_ids.append(road_ids[best])
+        nearest_names.append(road_names[best])
 
-    df["dist_to_road_m"] = dists
+    df["dist_to_road_m"]   = dists
+    df["nearest_road_id"]  = nearest_ids
+    df["nearest_road_name"] = nearest_names
     return df
 
 
@@ -76,18 +79,17 @@ def detect_candidate_map_changes(
         raise ValueError("Run calculate_road_residuals() first.")
 
     suspicious = df[df["dist_to_road_m"] > dist_threshold_m].copy()
-    logger.info(
-        "Suspicious observations (dist > %.1f m): %d / %d total (%.1f%%)",
-        dist_threshold_m,
-        len(suspicious),
-        len(df),
-        100 * len(suspicious) / max(len(df), 1),
-    )
+    logger.info(        "Suspicious observations (dist > %.1f m): %d / %d total (%.1f%%)",
+        dist_threshold_m,        len(suspicious),        len(df),        100 * len(suspicious) / max(len(df), 1),    )
 
     if suspicious.empty:
         return pd.DataFrame(), suspicious
 
-    # Aggregate by H3 cell
+    # H3 is the spatial grouping mechanism that heps to identify the candidate regions
+    # every fix already carries a cell ID, so "are these fixes near each
+    # other?" becomes a plain groupby — no spatial index, no distance query needed.
+    # Two fixes in the same res-11 hexagon (~25 m) are close enough to count as
+    # the same location, letting unique vehicle counts accumulate per zone.
     agg = (
         suspicious.groupby("h3_cell_res11")
         .agg(
@@ -110,17 +112,14 @@ def detect_candidate_map_changes(
 
     candidate_cells["candidate_road_change"] = True
 
-    logger.info(
-        "Candidate change cells: %d (out of %d suspicious cells)",
-        len(candidate_cells),
-        len(agg),
-    )
+    logger.info(        "Candidate change cells: %d (out of %d suspicious cells)",        len(candidate_cells),        len(agg),    )
     return candidate_cells, suspicious
 
 
 def validate_candidate_change(
     candidate_cells: pd.DataFrame,
     df_with_ground_truth: pd.DataFrame,
+    dist_threshold_m: float = 18.0,
 ) -> dict:
     """Compare detected candidates against synthetic ground truth.
 
@@ -147,9 +146,11 @@ def validate_candidate_change(
     # Did we catch any of the true change area?
     detected = len(true_positives) > 0
 
-    # Unique vehicles in detected cells
+    # Unique vehicles with off-road fixes inside detected cells.
+    # Excludes normal vehicles that merely passed through the same H3 zone on-road.
     veh_in_detected = df_with_ground_truth[
         df_with_ground_truth["h3_cell_res11"].isin(detected_cells)
+        & (df_with_ground_truth["dist_to_road_m"] > dist_threshold_m)
     ]["vehicle_id"].nunique()
 
     metrics = {

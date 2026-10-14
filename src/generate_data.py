@@ -45,25 +45,38 @@ def _offset_linestring(line: LineString, offset_m: float) -> LineString:
 def generate_road_network() -> gpd.GeoDataFrame:
     """Return a GeoDataFrame of the existing mapped road segments.
 
-    Represents a simplified segment of Wilson Blvd in Arlington, VA running
-    roughly east-west.  Coordinates are WGS84 (EPSG:4326).
+    Two roads:
+      1. Wilson Blvd       — east-west, ~2.4 km (Courthouse → Ballston)
+      2. N Courthouse Rd   — north-south, crosses Wilson Blvd near its midpoint
+
+    The cross street creates a genuine map-matching ambiguity zone:
+    GPS fixes near the intersection fall within the search radius of BOTH roads.
+    Nearest-road matching may snap to the wrong road there; HMM uses trajectory
+    continuity to stay on the correct road.
     """
-    # Approximate Wilson Blvd segment: Courthouse → Ballston (~2.4 km)
-    road_coords = [
+    # Wilson Blvd (east-west)
+    wilson = LineString([
         (-77.0820, 38.8862),
         (-77.0750, 38.8870),
         (-77.0680, 38.8875),
         (-77.0610, 38.8880),
         (-77.0540, 38.8882),
         (-77.0470, 38.8880),
-    ]
-    road = LineString(road_coords)
+    ])
+
+    # N Courthouse Rd (north-south) — crosses Wilson at approx (-77.0645, 38.8873)
+    # Extends ~400m north and ~400m south of Wilson
+    courthouse = LineString([
+        (-77.0645, 38.8909),   # ~400m north of Wilson
+        (-77.0645, 38.8873),   # intersection with Wilson
+        (-77.0645, 38.8837),   # ~400m south of Wilson
+    ])
 
     gdf = gpd.GeoDataFrame(
         {
-            "road_id": [1],
-            "road_name": ["Wilson Blvd (simulated)"],
-            "geometry": [road],
+            "road_id":   [1, 2],
+            "road_name": ["Wilson Blvd", "N Courthouse Rd"],
+            "geometry":  [wilson, courthouse],
         },
         crs="EPSG:4326",
     )
@@ -128,20 +141,21 @@ def generate_probe_data(
             pt = line.interpolate(frac, normalized=True)
             lon_clean, lat_clean = pt.x, pt.y
 
-            # Convert to UTM to add metric noise, then back
+            # Add metric noise in UTM, compute heading while still in UTM,
+            # then convert to WGS84 once at the end
             utm_x, utm_y = _TO_UTM.transform(lon_clean, lat_clean)
             utm_x += rng.normal(0, noise_std_m)
             utm_y += rng.normal(0, noise_std_m)
-            lon_noisy, lat_noisy = _TO_WGS.transform(utm_x, utm_y)
 
-            # Approximate heading from previous point
             if i == 0:
                 heading = 90.0  # start heading east
             else:
                 prev = records[-1]
-                dlat = lat_noisy - prev["latitude"]
-                dlon = lon_noisy - prev["longitude"]
-                heading = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
+                dx = utm_x - prev["_utm_x"]
+                dy = utm_y - prev["_utm_y"]
+                heading = (math.degrees(math.atan2(dx, dy)) + 360) % 360
+
+            lon_noisy, lat_noisy = _TO_WGS.transform(utm_x, utm_y)
 
             # Approximate speed: ~40 km/h with small variation
             speed = float(rng.normal(40.0, 5.0))
@@ -158,6 +172,8 @@ def generate_probe_data(
                     "speed": round(speed, 2),
                     "heading": round(heading, 2),
                     "ground_truth_type": label,
+                    "_utm_x": utm_x,   # kept for next-point heading, dropped below
+                    "_utm_y": utm_y,
                 }
             )
 
@@ -167,7 +183,7 @@ def generate_probe_data(
     for vid in range(n_normal, n_vehicles):
         _add_vehicle(vid, candidate_road, "candidate_new_road")
 
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(records).drop(columns=["_utm_x", "_utm_y"])
     logger.info(
         "Generated %d observations: %d normal vehicles, %d candidate-road vehicles",
         len(df),

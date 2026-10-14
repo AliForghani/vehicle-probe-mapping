@@ -112,6 +112,7 @@ def map_match_nearest(
     results = []
     for row in vehicle_df.itertuples():
         pt = Point(row.longitude, row.latitude)
+        # this function calculate distance for ll roads and then sort them--the first item would be closest
         candidates = get_candidates(pt, roads_gdf, search_radius_m)
         if candidates:
             best = candidates[0]
@@ -137,10 +138,26 @@ def map_match_nearest(
 # ── HMM / Viterbi-style trajectory-aware matching ────────────────────────────
 
 def _emission_prob(dist_m: float, sigma_m: float = 15.0) -> float:
-    """Gaussian emission: probability that a GPS point with dist_m error
-    came from this road candidate.
+    """Probability that a GPS observation came from a road at dist_m away.
 
-    Higher sigma = more tolerant of noisy GPS.
+    GPS positioning error is approximately Gaussian, so the likelihood of
+    observing a fix dist_m away from the true road follows:
+
+        P ∝ exp( -dist_m² / (2 · sigma_m²) )
+
+    Returns a value in (0, 1]:
+        dist =  0 m  → 1.00  (fix sits exactly on the road)
+        dist = 15 m  → 0.61  (one sigma — still plausible)
+        dist = 30 m  → 0.14  (two sigma — unlikely but possible)
+        dist = 60 m  → 0.0003 (four sigma — nearly impossible)
+
+    sigma_m is the assumed GPS noise standard deviation in metres.
+    Increase it to make the matcher more tolerant of noisy receivers;
+    decrease it for high-precision GPS (RTK, etc.).
+
+    Raw distance is NOT used directly because Viterbi multiplies scores
+    across all fixes — a probability in (0,1] stays numerically stable,
+    while multiplying raw distances produces meaningless unbounded values.
     """
     return math.exp(-(dist_m ** 2) / (2 * sigma_m ** 2))
 
@@ -150,18 +167,23 @@ def _transition_score(
     curr_candidate: RoadCandidate,
     gps_dist_m: float,
 ) -> float:
-    """Transition score: how plausible is moving from prev_candidate to curr_candidate?
+    """How plausible is it to move from prev_candidate's road to curr_candidate's road?
 
-    Uses the "great circle / route distance" heuristic from Newson & Krumm (2009):
-    the actual road distance should be close to the GPS straight-line distance.
+    Key idea (Newson & Krumm 2009): the distance between consecutive snap points
+    on the road network should be close to the straight-line GPS distance between
+    the two raw fixes. A large mismatch means the candidate pair requires the
+    vehicle to have teleported or made an implausible detour.
 
-    Simplified here: penalise candidate pairs where the snap-point jump is
-    disproportionately large compared to GPS movement.
+    Example — fix near the Wilson/Courthouse intersection:
+      prev snap on Wilson, curr snap on Wilson  → snap_dist ≈ gps_dist → high score
+      prev snap on Wilson, curr snap on Courthouse → snap_dist >> gps_dist → low score
+                                                     (vehicle would have had to jump roads)
+
+    beta controls the tolerance in metres; smaller beta = harsher penalty for mismatches.
     """
     snap_dist = _dist_m(prev_candidate.closest_point, curr_candidate.closest_point)
     diff = abs(snap_dist - gps_dist_m)
-    # Exponential penalty for mismatch
-    beta = 30.0  # metres
+    beta = 30.0  # metres — penalty scale; tune for road density and GPS sample rate
     return math.exp(-diff / beta)
 
 
@@ -186,82 +208,76 @@ def map_match_trajectory(
     - Emission prob   = how well the GPS point fits the road candidate
     - Transition prob = how plausible the candidate-to-candidate move is
 
-    Returns vehicle_df with matched columns appended.
+    Returns a DataFrame with matched columns for each GPS fix.
     """
-    # Process one vehicle at a time to maintain trajectory order
-    all_results: list[dict] = []
+    df = vehicle_df.sort_values("timestamp").reset_index(drop=True)
+    n = len(df)
 
-    for vehicle_id, grp in vehicle_df.groupby("vehicle_id"):
-        grp = grp.sort_values("timestamp").reset_index(drop=True)
-        n = len(grp)
+    # Collect candidates for every GPS point
+    candidates_per_step: list[list[RoadCandidate]] = []
+    for row in df.itertuples():
+        pt = Point(row.longitude, row.latitude)
+        cands = get_candidates(pt, roads_gdf, search_radius_m)
+        if not cands:
+            cands = [RoadCandidate(-1, "unmatched", LineString(), 999.0, pt)]
+        candidates_per_step.append(cands)
 
-        # Collect candidates for every GPS point
-        candidates_per_step: list[list[RoadCandidate]] = []
-        for row in grp.itertuples():
-            pt = Point(row.longitude, row.latitude)
-            cands = get_candidates(pt, roads_gdf, search_radius_m)
-            if not cands:
-                # No road nearby — add a dummy "unmatched" placeholder
-                cands = [RoadCandidate(-1, "unmatched", LineString(), 999.0, pt)]
-            candidates_per_step.append(cands)
+    # Viterbi: viterbi[t][i] = (best_log_score, prev_candidate_index)
+    NEG_INF = float("-inf")
+    viterbi: list[list[tuple[float, int]]] = []
 
-        # Viterbi: viterbi[t][i] = (best_log_score, prev_candidate_index)
-        NEG_INF = float("-inf")
-        viterbi: list[list[tuple[float, int]]] = []
+    # Initialise at t=0--  there is no previous fix--only the emission score matters.
+    init_scores = []
+    for cand in candidates_per_step[0]:
+        log_em = math.log(max(_emission_prob(cand.dist_m, sigma_m), 1e-12))
+        init_scores.append((log_em, -1))
+    viterbi.append(init_scores)
 
-        # Initialise at t=0
-        init_scores = []
-        for cand in candidates_per_step[0]:
-            log_em = math.log(max(_emission_prob(cand.dist_m, sigma_m), 1e-12))
-            init_scores.append((log_em, -1))
-        viterbi.append(init_scores)
+    # Forward pass
+    for t in range(1, n):
+        step_scores = []
+        gps_pt_t    = Point(df.iloc[t].longitude,     df.iloc[t].latitude)
+        gps_pt_prev = Point(df.iloc[t - 1].longitude, df.iloc[t - 1].latitude)
+        gps_dist = _dist_m(gps_pt_prev, gps_pt_t) ## used for transition score.
 
-        # Forward pass
-        for t in range(1, n):
-            step_scores = []
-            row_t = grp.iloc[t]
-            row_prev = grp.iloc[t - 1]
-            gps_pt_t = Point(row_t.longitude, row_t.latitude)
-            gps_pt_prev = Point(row_prev.longitude, row_prev.latitude)
-            gps_dist = _dist_m(gps_pt_prev, gps_pt_t)
+        for curr_cand in candidates_per_step[t]:
+            log_em = math.log(max(_emission_prob(curr_cand.dist_m, sigma_m), 1e-12))
+            best_score = NEG_INF
+            best_prev_idx = 0
+            for prev_idx, prev_cand in enumerate(candidates_per_step[t - 1]):
+                prev_score = viterbi[t - 1][prev_idx][0]
+                if prev_score == NEG_INF:
+                    continue
+                tr = _transition_score(prev_cand, curr_cand, gps_dist)
+                log_tr = math.log(max(tr, 1e-12))
+                score = prev_score + log_tr + log_em
+                if score > best_score:
+                    best_score = score
+                    best_prev_idx = prev_idx
+            step_scores.append((best_score, best_prev_idx))
+        viterbi.append(step_scores)
 
-            for curr_cand in candidates_per_step[t]:
-                log_em = math.log(max(_emission_prob(curr_cand.dist_m, sigma_m), 1e-12))
-                best_score = NEG_INF
-                best_prev_idx = 0
-                for prev_idx, prev_cand in enumerate(candidates_per_step[t - 1]):
-                    prev_score = viterbi[t - 1][prev_idx][0]
-                    if prev_score == NEG_INF:
-                        continue
-                    tr = _transition_score(prev_cand, curr_cand, gps_dist)
-                    log_tr = math.log(max(tr, 1e-12))
-                    score = prev_score + log_tr + log_em
-                    if score > best_score:
-                        best_score = score
-                        best_prev_idx = prev_idx
-                step_scores.append((best_score, best_prev_idx))
-            viterbi.append(step_scores)
+    # Traceback
+    matched_indices: list[int] = [0] * n
+    best_last = max(range(len(viterbi[-1])), key=lambda i: viterbi[-1][i][0])
+    matched_indices[n - 1] = best_last
+    for t in range(n - 2, -1, -1):
+        matched_indices[t] = viterbi[t + 1][matched_indices[t + 1]][1]
 
-        # Traceback
-        matched_indices: list[int] = [0] * n
-        best_last = max(range(len(viterbi[-1])), key=lambda i: viterbi[-1][i][0])
-        matched_indices[n - 1] = best_last
-        for t in range(n - 2, -1, -1):
-            matched_indices[t] = viterbi[t + 1][matched_indices[t + 1]][1]
+    # Build result rows
+    results = []
+    for t, row in enumerate(df.itertuples()):
+        cand = candidates_per_step[t][matched_indices[t]]
+        results.append({
+            "vehicle_id": row.vehicle_id,
+            "timestamp": row.timestamp,
+            "latitude": row.latitude,
+            "longitude": row.longitude,
+            "hmm_matched_road_id": cand.road_id,
+            "hmm_matched_road_name": cand.road_name,
+            "hmm_match_dist_m": round(cand.dist_m, 2),
+            "hmm_matched_lon": cand.closest_point.x,
+            "hmm_matched_lat": cand.closest_point.y,
+        })
 
-        # Build result rows
-        for t, row in enumerate(grp.itertuples()):
-            cand = candidates_per_step[t][matched_indices[t]]
-            all_results.append({
-                "vehicle_id": row.vehicle_id,
-                "timestamp": row.timestamp,
-                "latitude": row.latitude,
-                "longitude": row.longitude,
-                "hmm_matched_road_id": cand.road_id,
-                "hmm_matched_road_name": cand.road_name,
-                "hmm_match_dist_m": round(cand.dist_m, 2),
-                "hmm_matched_lon": cand.closest_point.x,
-                "hmm_matched_lat": cand.closest_point.y,
-            })
-
-    return pd.DataFrame(all_results)
+    return pd.DataFrame(results)
