@@ -1,42 +1,114 @@
 """
 Visualization helpers for probe data analysis.
 
-Returns matplotlib figures (used directly by Streamlit via st.pyplot()).
+Returns Plotly figures (rendered in Streamlit via st.plotly_chart()) so maps
+support zoom, pan and hover inspection.
 """
 
-from typing import Optional
+from typing import Iterable, Optional
 
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+BLUE = "#4C9BE8"
+RED = "#E84C4C"
+GREEN = "#2ECC71"
+ORANGE = "orange"
+
+# Shared Plotly config for st.plotly_chart: mouse-wheel zoom on, logo off.
+PLOTLY_CONFIG = {"scrollZoom": True, "displaylogo": False}
 
 
-def plot_raw_probes(df: pd.DataFrame, roads_gdf: gpd.GeoDataFrame) -> plt.Figure:
-    """Map 1: raw probe data coloured by ground_truth_type."""
-    fig, ax = plt.subplots(figsize=(12, 5))
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-    # Road
-    for geom in roads_gdf.geometry:
+def _base_figure(title: str, roads_gdf: gpd.GeoDataFrame, height: int = 500) -> go.Figure:
+    """Figure with lon/lat axes at true ground aspect ratio."""
+    fig = go.Figure()
+    # At this latitude one degree of longitude is cos(lat) shorter than one
+    # degree of latitude; lock the axes so distances/angles look right.
+    _, miny, _, maxy = roads_gdf.total_bounds if len(roads_gdf) else (0, 0, 0, 0)
+    mean_lat = (miny + maxy) / 2.0
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=15)),
+        height=height,
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(255,255,255,0.75)", font=dict(size=11)),
+        dragmode="pan",
+        hovermode="closest",
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(title="Longitude", showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_yaxes(
+        title="Latitude", showgrid=True, gridcolor="#eee", zeroline=False,
+        scaleanchor="x", scaleratio=1.0 / np.cos(np.radians(mean_lat)),
+    )
+    return fig
+
+
+def _add_roads(
+    fig: go.Figure,
+    roads_gdf: gpd.GeoDataFrame,
+    colors: Iterable[str] = ("black",),
+    show_names: bool = False,
+) -> None:
+    colors = list(colors)
+    for i, (geom, name) in enumerate(zip(roads_gdf.geometry, roads_gdf["road_name"])):
         xs, ys = geom.xy
-        ax.plot(xs, ys, "k-", linewidth=3, label="Mapped road", zorder=3)
+        fig.add_trace(go.Scatter(
+            x=list(xs), y=list(ys), mode="lines",
+            line=dict(color=colors[i % len(colors)], width=4),
+            name=name if show_names else "Mapped road (existing map)",
+            legendgroup=None if show_names else "roads",
+            showlegend=show_names or i == 0,
+            hovertemplate=f"{name}<extra></extra>",
+        ))
 
-    # Normal probes
+
+def _points(df: pd.DataFrame, lon: str = "longitude", lat: str = "latitude", **kwargs) -> go.Scattergl:
+    """WebGL scatter of probe points with vehicle/speed hover info when available."""
+    custom_cols = [c for c in ("vehicle_id", "derived_speed_kmh", "dist_to_road_m") if c in df.columns]
+    hover = "lon %{x:.5f}<br>lat %{y:.5f}"
+    for i, c in enumerate(custom_cols):
+        fmt = "" if c == "vehicle_id" else ":.1f"
+        hover += f"<br>{c} %{{customdata[{i}]{fmt}}}"
+    return go.Scattergl(
+        x=df[lon], y=df[lat], mode="markers",
+        customdata=df[custom_cols].values if custom_cols else None,
+        hovertemplate=hover + "<extra>%{fullData.name}</extra>",
+        **kwargs,
+    )
+
+
+def _snap_segments(pairs: Iterable[tuple]) -> tuple:
+    """Flatten (x0, y0, x1, y1) pairs into one x/y list separated by None."""
+    xs, ys = [], []
+    for x0, y0, x1, y1 in pairs:
+        xs += [x0, x1, None]
+        ys += [y0, y1, None]
+    return xs, ys
+
+
+# ── Maps ───────────────────────────────────────────────────────────────────────
+
+def plot_raw_probes(df: pd.DataFrame, roads_gdf: gpd.GeoDataFrame) -> go.Figure:
+    """Map 1: raw probe data coloured by the simulation's ground_truth_type.
+
+    The colours are the simulation's answer key — real data carries no such label.
+    """
+    fig = _base_figure("Raw Probe Data — Arlington VA", roads_gdf)
+
     normal = df[df["ground_truth_type"] == "mapped_road"]
-    ax.scatter(normal["longitude"], normal["latitude"],
-               s=4, c="#4C9BE8", alpha=0.5, label="Normal GPS (mapped road)")
+    fig.add_trace(_points(normal, name="GPS fixes — vehicles on mapped road (simulated truth)",
+                          marker=dict(size=4, color=BLUE, opacity=0.5)))
 
-    # Candidate new road
     cand = df[df["ground_truth_type"] == "candidate_new_road"]
-    ax.scatter(cand["longitude"], cand["latitude"],
-               s=4, c="#E84C4C", alpha=0.7, label="Candidate new road")
+    fig.add_trace(_points(cand, name="GPS fixes — vehicles on unmapped new road (simulated truth)",
+                          marker=dict(size=4, color=RED, opacity=0.7)))
 
-    ax.set_title("Raw Probe Data — Arlington VA", fontsize=13)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    ax.legend(loc="upper left", fontsize=9)
-    fig.tight_layout()
+    _add_roads(fig, roads_gdf)
     return fig
 
 
@@ -44,165 +116,191 @@ def plot_filtered_probes(
     cleaned: pd.DataFrame,
     removed: pd.DataFrame,
     roads_gdf: gpd.GeoDataFrame,
-) -> plt.Figure:
+) -> go.Figure:
     """Map 2: cleaned vs removed GPS noise observations."""
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for geom in roads_gdf.geometry:
-        xs, ys = geom.xy
-        ax.plot(xs, ys, "k-", linewidth=3, zorder=3)
-    ax.scatter(cleaned["longitude"], cleaned["latitude"],
-               s=4, c="#4C9BE8", alpha=0.4, label="Kept")
+    fig = _base_figure("Preprocessing Filter: Kept vs Removed", roads_gdf)
+    fig.add_trace(_points(cleaned, name="Kept",
+                          marker=dict(size=4, color=BLUE, opacity=0.4)))
     if not removed.empty:
-        ax.scatter(removed["longitude"], removed["latitude"],
-                   s=20, c="red", marker="x", label="Removed (noise)")
-    ax.set_title("Preprocessing Filter: Kept vs Removed", fontsize=13)
-    ax.legend(fontsize=9)
-    fig.tight_layout()
+        fig.add_trace(_points(removed, name="Removed (noise)",
+                              marker=dict(size=8, color="red", symbol="x")))
+    _add_roads(fig, roads_gdf)
     return fig
 
 
 def plot_h3_aggregation(
     h3_agg: pd.DataFrame,
     roads_gdf: gpd.GeoDataFrame,
-    color_by: str = "unique_vehicles",
-) -> plt.Figure:
-    """Map 3: H3 cell centres coloured by observation density or unique vehicles."""
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for geom in roads_gdf.geometry:
-        xs, ys = geom.xy
-        ax.plot(xs, ys, "k-", linewidth=3, zorder=3)
-
-    vals = h3_agg[color_by].values
-    sc = ax.scatter(
-        h3_agg["lng_center"], h3_agg["lat_center"],
-        c=vals, cmap="YlOrRd", s=80, alpha=0.8, edgecolors="none",
+    resolution: Optional[int] = None,
+) -> go.Figure:
+    """Map 3: two stacked maps of H3 cell centres — unique vehicles (top) and
+    average speed (bottom). Axes are linked, so zoom/pan applies to both."""
+    panels = [
+        ("unique_vehicles", "Unique vehicles", "YlOrRd"),
+        ("avg_speed", "Avg speed (km/h)", "Viridis"),
+    ]
+    res_txt = f" (res {resolution})" if resolution is not None else ""
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        subplot_titles=[f"{label} per H3 cell{res_txt}" for _, label, _ in panels],
     )
-    plt.colorbar(sc, ax=ax, label=color_by.replace("_", " ").title())
-    ax.set_title(f"H3 Aggregation — {color_by.replace('_', ' ').title()} per Cell (res 11)", fontsize=13)
-    fig.tight_layout()
+
+    hover = (
+        "%{customdata[0]}<br>obs %{customdata[1]}<br>"
+        "vehicles %{customdata[2]}<br>avg speed %{customdata[3]:.1f} km/h<extra></extra>"
+    )
+    custom = h3_agg[["h3_cell", "observations", "unique_vehicles", "avg_speed"]].values
+
+    for row, (col, label, scale) in enumerate(panels, start=1):
+        for geom, name in zip(roads_gdf.geometry, roads_gdf["road_name"]):
+            xs, ys = geom.xy
+            fig.add_trace(go.Scatter(
+                x=list(xs), y=list(ys), mode="lines",
+                line=dict(color="black", width=4),
+                name="Mapped road (existing map)", legendgroup="roads",
+                showlegend=(row == 1 and name == roads_gdf["road_name"].iloc[0]),
+                hovertemplate=f"{name}<extra></extra>",
+            ), row=row, col=1)
+
+        fig.add_trace(go.Scattergl(
+            x=h3_agg["lng_center"], y=h3_agg["lat_center"], mode="markers",
+            name=label, showlegend=False,
+            marker=dict(
+                size=10, color=h3_agg[col], colorscale=scale, opacity=0.85,
+                colorbar=dict(title=label, len=0.42, y=0.79 if row == 1 else 0.21),
+            ),
+            customdata=custom, hovertemplate=hover,
+        ), row=row, col=1)
+
+    # True ground aspect on the top map; the bottom map shares both axes,
+    # so it gets the same ranges and zoom/pan stays in sync.
+    _, miny, _, maxy = roads_gdf.total_bounds if len(roads_gdf) else (0, 0, 0, 0)
+    fig.update_yaxes(scaleanchor="x", scaleratio=1.0 / np.cos(np.radians((miny + maxy) / 2.0)),
+                     row=1, col=1)
+    fig.update_yaxes(matches="y", row=2, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_yaxes(title="Latitude", showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_xaxes(title="Longitude", row=2, col=1)
+    fig.update_layout(
+        height=800,
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(255,255,255,0.75)", font=dict(size=11)),
+        dragmode="pan",
+        hovermode="closest",
+        plot_bgcolor="white",
+    )
     return fig
 
 
-def plot_map_matching(
+def _add_matching_traces(
+    fig: go.Figure,
+    col: int,
     vehicle_df: pd.DataFrame,
     matched_df: pd.DataFrame,
     roads_gdf: gpd.GeoDataFrame,
-    vehicle_id: Optional[str] = None,
-) -> plt.Figure:
-    """Map 4: one vehicle trajectory with nearest-road snap points.
+    vehicle_id: str,
+    prefix: str,
+    showlegend: bool,
+) -> None:
+    """Draw roads, raw trajectory, snapped points and snap lines into panel `col`.
 
-    Draws all mapped roads so the intersection ambiguity zone is visible.
     Snap lines are coloured by which road was matched:
-      - green  = Wilson Blvd (correct for east-west vehicle)
-      - red    = cross street (likely a mismatch near the intersection)
-    """
-    fig, ax = plt.subplots(figsize=(12, 5))
+      green = Wilson Blvd (correct for east-west vehicle)
+      red   = cross street (mismatch near the intersection)
 
-    # Draw each road with a distinct colour and label
-    road_colors = ["black", "#888888"]
+    Traces share a legendgroup across panels, so one legend click toggles both.
+    """
+    lon_col, lat_col, road_col = f"{prefix}_lon", f"{prefix}_lat", f"{prefix}_road_id"
+
+    road_colors = ("black", "#888888")
     for i, (geom, name) in enumerate(zip(roads_gdf.geometry, roads_gdf["road_name"])):
         xs, ys = geom.xy
-        ax.plot(xs, ys, color=road_colors[i % len(road_colors)],
-                linewidth=3, zorder=3, label=name)
-
-    if vehicle_id is None:
-        vehicle_id = vehicle_df["vehicle_id"].iloc[0]
+        fig.add_trace(go.Scatter(
+            x=list(xs), y=list(ys), mode="lines",
+            line=dict(color=road_colors[i % len(road_colors)], width=4),
+            name=name, legendgroup=f"road-{name}", showlegend=showlegend,
+            hovertemplate=f"{name}<extra></extra>",
+        ), row=1, col=col)
 
     veh = vehicle_df[vehicle_df["vehicle_id"] == vehicle_id].sort_values("timestamp")
-    ax.plot(veh["longitude"], veh["latitude"], "b.-", alpha=0.6,
-            markersize=5, linewidth=1, label="Raw GPS trajectory")
+    vm = matched_df[matched_df["vehicle_id"] == vehicle_id].dropna(subset=[lon_col, lat_col])
 
-    vm = matched_df[matched_df["vehicle_id"] == vehicle_id].dropna(
-        subset=["matched_lon", "matched_lat"]
-    )
-    ax.scatter(vm["matched_lon"], vm["matched_lat"],
-               s=15, c="orange", zorder=4, label="Snapped position (nearest road)")
-
-    # Snap lines: red if snapped to cross street (road_id != 1), green otherwise
     wilson_road_id = roads_gdf[roads_gdf["road_name"].str.contains("Wilson")]["road_id"].iloc[0]
-    for _, row in vm.iterrows():
-        orig_row = veh[veh["timestamp"] == row["timestamp"]]
-        if orig_row.empty:
-            continue
-        snapped_to_cross = (row.get("matched_road_id") != wilson_road_id)
-        color = "#E84C4C" if snapped_to_cross else "#2ECC71"
-        ax.plot(
-            [orig_row.iloc[0]["longitude"], row["matched_lon"]],
-            [orig_row.iloc[0]["latitude"],  row["matched_lat"]],
-            color=color, alpha=0.5, linewidth=1.0,
-        )
-
-    # Legend entries for snap line colours
-    ax.plot([], [], color="#2ECC71", linewidth=1.5, label="Snap → Wilson Blvd (correct)")
-    ax.plot([], [], color="#E84C4C", linewidth=1.5, label="Snap → cross street (mismatch)")
-
-    ax.set_title(
-        f"Map Matching — Vehicle {vehicle_id}  "
-        f"(red snap lines = nearest-road error near intersection)",
-        fontsize=11,
+    joined = vm.merge(
+        veh[["timestamp", "longitude", "latitude"]], on="timestamp",
+        how="inner", suffixes=("_m", ""),
     )
-    ax.legend(fontsize=8, loc="upper left")
-    fig.tight_layout()
-    return fig
+    on_wilson = joined[road_col] == wilson_road_id
+
+    for mask, color, name in (
+        (on_wilson, GREEN, "Snap → Wilson Blvd (correct)"),
+        (~on_wilson, RED, "Snap → cross street (mismatch)"),
+    ):
+        sub = joined[mask]
+        xs, ys = _snap_segments(zip(sub["longitude"], sub["latitude"], sub[lon_col], sub[lat_col]))
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=name, legendgroup=name, showlegend=showlegend,
+            line=dict(color=color, width=1.5), opacity=0.6, hoverinfo="skip",
+        ), row=1, col=col)
+
+    fig.add_trace(go.Scatter(
+        x=veh["longitude"], y=veh["latitude"], mode="lines+markers",
+        name="Raw GPS trajectory", legendgroup="raw", showlegend=showlegend,
+        line=dict(color="blue", width=1), marker=dict(size=5, color="blue"), opacity=0.6,
+        hovertemplate="%{text}<br>lon %{x:.5f}<br>lat %{y:.5f}<extra>raw</extra>",
+        text=veh["timestamp"].astype(str),
+    ), row=1, col=col)
+    fig.add_trace(go.Scatter(
+        x=vm[lon_col], y=vm[lat_col], mode="markers",
+        name="Snapped position", legendgroup="snapped", showlegend=showlegend,
+        marker=dict(size=6, color=ORANGE),
+        customdata=vm[[road_col]].values,
+        hovertemplate="road %{customdata[0]}<br>lon %{x:.5f}<br>lat %{y:.5f}<extra>snapped</extra>",
+    ), row=1, col=col)
 
 
-def plot_hmm_matching(
+def plot_matching_comparison(
     vehicle_df: pd.DataFrame,
+    matched_df: pd.DataFrame,
     hmm_df: pd.DataFrame,
     roads_gdf: gpd.GeoDataFrame,
     vehicle_id: Optional[str] = None,
-) -> plt.Figure:
-    """Map 4b: same vehicle trajectory snapped by HMM / Viterbi.
+) -> go.Figure:
+    """Map 4: nearest-road (left) vs HMM / Viterbi (right) for one vehicle.
 
-    Uses hmm_matched_* columns from map_match_trajectory().
-    Snap lines are coloured the same way as plot_map_matching:
-      green  = Wilson Blvd (correct)
-      red    = cross street (mismatch — should be rare with HMM)
+    One figure with linked axes, so zoom/pan applies to both panels, and one
+    shared legend that toggles the same layer in both.
     """
-    fig, ax = plt.subplots(figsize=(12, 5))
-
-    road_colors = ["black", "#888888"]
-    for i, (geom, name) in enumerate(zip(roads_gdf.geometry, roads_gdf["road_name"])):
-        xs, ys = geom.xy
-        ax.plot(xs, ys, color=road_colors[i % len(road_colors)],
-                linewidth=3, zorder=3, label=name)
-
     if vehicle_id is None:
         vehicle_id = vehicle_df["vehicle_id"].iloc[0]
 
-    veh = vehicle_df[vehicle_df["vehicle_id"] == vehicle_id].sort_values("timestamp")
-    ax.plot(veh["longitude"], veh["latitude"], "b.-", alpha=0.6,
-            markersize=5, linewidth=1, label="Raw GPS trajectory")
-
-    vm = hmm_df[hmm_df["vehicle_id"] == vehicle_id].dropna(
-        subset=["hmm_matched_lon", "hmm_matched_lat"]
+    fig = make_subplots(
+        rows=1, cols=2, shared_xaxes=True, shared_yaxes=True, horizontal_spacing=0.03,
+        subplot_titles=["Nearest-road (baseline)", "HMM / Viterbi (trajectory-aware)"],
     )
-    ax.scatter(vm["hmm_matched_lon"], vm["hmm_matched_lat"],
-               s=15, c="orange", zorder=4, label="Snapped position (HMM)")
+    _add_matching_traces(fig, 1, vehicle_df, matched_df, roads_gdf, vehicle_id,
+                         prefix="matched", showlegend=True)
+    _add_matching_traces(fig, 2, vehicle_df, hmm_df, roads_gdf, vehicle_id,
+                         prefix="hmm_matched", showlegend=False)
 
-    wilson_road_id = roads_gdf[roads_gdf["road_name"].str.contains("Wilson")]["road_id"].iloc[0]
-    for _, row in vm.iterrows():
-        orig_row = veh[veh["timestamp"] == row["timestamp"]]
-        if orig_row.empty:
-            continue
-        snapped_to_cross = (row.get("hmm_matched_road_id") != wilson_road_id)
-        color = "#E84C4C" if snapped_to_cross else "#2ECC71"
-        ax.plot(
-            [orig_row.iloc[0]["longitude"], row["hmm_matched_lon"]],
-            [orig_row.iloc[0]["latitude"],  row["hmm_matched_lat"]],
-            color=color, alpha=0.5, linewidth=1.0,
-        )
-
-    ax.plot([], [], color="#2ECC71", linewidth=1.5, label="Snap → Wilson Blvd (correct)")
-    ax.plot([], [], color="#E84C4C", linewidth=1.5, label="Snap → cross street (mismatch)")
-
-    ax.set_title(
-        f"HMM / Viterbi Matching — Vehicle {vehicle_id}  "
-        f"(trajectory-aware: fewer red snaps near intersection)",
-        fontsize=11,
+    # True ground aspect on the left panel; the right panel shares both axes,
+    # so it gets the same ranges and zoom/pan stays in sync.
+    _, miny, _, maxy = roads_gdf.total_bounds if len(roads_gdf) else (0, 0, 0, 0)
+    fig.update_yaxes(scaleanchor="x", scaleratio=1.0 / np.cos(np.radians((miny + maxy) / 2.0)),
+                     row=1, col=1)
+    fig.update_xaxes(matches="x", row=1, col=2)
+    fig.update_xaxes(title="Longitude", showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_yaxes(title="Latitude", row=1, col=1)
+    fig.update_layout(
+        title=dict(text=f"Map Matching — Vehicle {vehicle_id}", font=dict(size=15)),
+        height=550,
+        margin=dict(l=10, r=10, t=70, b=10),
+        legend=dict(orientation="h", x=0, y=-0.15, font=dict(size=11)),
+        dragmode="pan",
+        hovermode="closest",
+        plot_bgcolor="white",
     )
-    ax.legend(fontsize=8, loc="upper left")
-    fig.tight_layout()
     return fig
 
 
@@ -211,50 +309,84 @@ def plot_change_detection(
     candidate_cells: pd.DataFrame,
     roads_gdf: gpd.GeoDataFrame,
     dist_threshold_m: float = 18.0,
-) -> plt.Figure:
+) -> go.Figure:
     """Map 5: suspicious observations and flagged candidate H3 cells."""
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for geom in roads_gdf.geometry:
-        xs, ys = geom.xy
-        ax.plot(xs, ys, "k-", linewidth=3, zorder=3)
+    fig = _base_figure("Change Detection: Noise vs Candidate Map Change", roads_gdf)
 
     normal = df[df["dist_to_road_m"] <= dist_threshold_m]
-    ax.scatter(normal["longitude"], normal["latitude"],
-               s=3, c="#4C9BE8", alpha=0.3, label="On-road obs")
+    fig.add_trace(_points(normal, name="On-road obs",
+                          marker=dict(size=3, color=BLUE, opacity=0.3)))
 
     susp = df[df["dist_to_road_m"] > dist_threshold_m]
-    ax.scatter(susp["longitude"], susp["latitude"],
-               s=8, c="orange", alpha=0.6, label="Suspicious off-road")
+    fig.add_trace(_points(susp, name="Suspicious off-road",
+                          marker=dict(size=6, color=ORANGE, opacity=0.6)))
+
+    _add_roads(fig, roads_gdf)
 
     if not candidate_cells.empty:
-        ax.scatter(
-            candidate_cells["avg_lon"], candidate_cells["avg_lat"],
-            s=120, c="red", marker="*", zorder=5,
-            label=f"Candidate change cell\n(≥{dist_threshold_m}m, multi-vehicle)",
-        )
-
-    ax.set_title("Change Detection: Noise vs Candidate Map Change", fontsize=13)
-    ax.legend(fontsize=8)
-    fig.tight_layout()
+        fig.add_trace(go.Scatter(
+            x=candidate_cells["avg_lon"], y=candidate_cells["avg_lat"], mode="markers",
+            name=f"Candidate change cell (≥{dist_threshold_m:.0f} m, multi-vehicle)",
+            marker=dict(size=16, color="red", symbol="star", line=dict(color="darkred", width=1)),
+            hovertemplate="candidate cell<br>lon %{x:.5f}<br>lat %{y:.5f}<extra></extra>",
+        ))
     return fig
 
 
-def summary_bar(metrics: dict) -> plt.Figure:
+def plot_threshold_sweep(
+    sweep: pd.DataFrame,
+    current_t: float,
+    noise_rule_t: Optional[float] = None,
+) -> go.Figure:
+    """True-change vs false-positive cells across off-road thresholds.
+
+    sweep: DataFrame with columns threshold_m, true_positive_cells, false_positive_cells.
+    Vertical reference lines mark the current slider value and the noise-only 3σ rule.
+    """
+    fig = go.Figure()
+    for col, name, color, symbol in (
+        ("true_positive_cells", "True-change cells detected", "#2F6FD0", "circle"),
+        ("false_positive_cells", "False-positive cells", "#D9822B", "diamond"),
+    ):
+        fig.add_trace(go.Scatter(
+            x=sweep["threshold_m"], y=sweep[col], mode="lines+markers", name=name,
+            line=dict(color=color, width=2), marker=dict(size=8, color=color, symbol=symbol),
+            hovertemplate=f"{name}: %{{y}}<extra></extra>",
+        ))
+
+    # Reference lines are drawn as legend entries (not top annotations) so their
+    # labels never collide when the values are close or equal.
+    refs = [(current_t, "Current setting", "solid")]
+    if noise_rule_t is not None:
+        refs.append((noise_rule_t, "3σ noise rule", "dash"))
+    y_top = max(1, sweep[["true_positive_cells", "false_positive_cells"]].values.max()) * 1.05
+    for x, label, dash in refs:
+        fig.add_trace(go.Scatter(
+            x=[x, x], y=[0, y_top], mode="lines",
+            name=f"{label} ({x:.1f} m)",
+            line=dict(color="#555", width=1.5, dash=dash),
+            hovertemplate=f"{label}: {x:.1f} m<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=dict(text="Threshold sweep — detections vs false positives", font=dict(size=15)),
+        height=440,
+        margin=dict(l=10, r=10, t=50, b=10),
+        hovermode="x unified",
+        plot_bgcolor="white",
+        legend=dict(orientation="h", x=0, y=-0.2, font=dict(size=11)),
+    )
+    fig.update_xaxes(title="Off-road threshold (m)", showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_yaxes(title="H3 cells", showgrid=True, gridcolor="#eee", zeroline=False, rangemode="tozero")
+    return fig
+
+
+def summary_bar(metrics: dict) -> go.Figure:
     """Simple bar chart of key summary metrics."""
-    labels = ["Total obs", "Unique vehicles", "Removed noise",
-              "Off-road obs", "Candidate cells"]
-    values = [
-        metrics.get("total_obs", 0),
-        metrics.get("unique_vehicles", 0),
-        metrics.get("removed_noise", 0),
-        metrics.get("off_road_obs", 0),
-        metrics.get("candidate_cells", 0),
-    ]
-    colors = ["#4C9BE8", "#4C9BE8", "#E84C4C", "orange", "red"]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    bars = ax.bar(labels, values, color=colors)
-    ax.bar_label(bars, fmt="%d")
-    ax.set_title("Simulation Summary", fontsize=13)
-    ax.set_ylabel("Count")
-    fig.tight_layout()
+    labels = ["Total obs", "Unique vehicles", "Removed noise", "Off-road obs", "Candidate cells"]
+    keys = ["total_obs", "unique_vehicles", "removed_noise", "off_road_obs", "candidate_cells"]
+    values = [metrics.get(k, 0) for k in keys]
+    colors = [BLUE, BLUE, RED, ORANGE, "red"]
+    fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors, text=values, textposition="outside"))
+    fig.update_layout(title="Simulation Summary", yaxis_title="Count", height=400)
     return fig

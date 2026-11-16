@@ -8,5 +8,5 @@ sqlalchemy>=2.0
 geoalchemy2>=0.14
 psycopg2-binary>=2.9
 streamlit>=1.35
-matplotlib>=3.8
+plotly>=5.18
 pytest>=8.0

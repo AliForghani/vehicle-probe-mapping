@@ -1,9 +1,8 @@
 # vehicle-probe-spatial-indexing
 
-A GitHub-ready Python + PostGIS prototype demonstrating how vehicle GPS/probe data
+A Python + PostGIS prototype demonstrating how vehicle GPS/probe data
 is processed, spatially indexed, map-matched, and analyzed to detect candidate road
-network changes — all in a small, locally runnable dataset designed to be explainable
-in a technical interview.
+network changes — all in a small, locally runnable dataset.
 
 ---
 
@@ -104,7 +103,7 @@ vehicle-probe-mapping/
 │   ├── spatial_queries.py ST_DWithin, residuals, aggregation
 │   ├── map_matching.py    Nearest-road + HMM/Viterbi matcher
 │   ├── change_detection.py Distance residuals + candidate detection
-│   └── visualization.py   Matplotlib figures for Streamlit
+│   └── visualization.py   Interactive Plotly figures for Streamlit
 ├── sql/
 │   ├── create_tables.sql
 │   ├── create_indexes.sql
@@ -278,9 +277,7 @@ many independent vehicles
 
 ---
 
-## Interview Question 1 — Automotive-Scale Architecture
-
-> "Suppose we receive **billions** of GPS observations. How do you design the pipeline?"
+## Automotive-Scale Architecture
 
 ```
 Vehicle telemetry
@@ -320,9 +317,7 @@ H3-partitioned Parquet files.
 
 ---
 
-## Interview Question 2 — Noise vs New Road
-
-> "How do you tell GPS noise from an actual new road or lane?"
+## GPS Noise vs New Road
 
 | Evidence | Interpretation |
 |---|---|
@@ -335,9 +330,7 @@ heading consistency, persistence across time windows, spatial clustering.
 
 ---
 
-## Interview Question 3 — Map Matching
-
-> "How do you map-match noisy vehicle GPS?"
+## Map Matching
 
 1. Find candidate road segments within search radius (ST_DWithin)
 2. Score each candidate: Gaussian emission model on perpendicular distance

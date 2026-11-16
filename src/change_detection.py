@@ -60,13 +60,14 @@ def detect_candidate_map_changes(
     dist_threshold_m: float = 18.0,
     min_observations: int = 5,
     min_unique_vehicles: int = 3,
+    resolution: int = 11,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Flag H3 cells as candidate map changes.
 
     Algorithm:
     1. Flag individual observations where dist_to_road_m > dist_threshold_m
        (these are *suspicious* — not confirmed noise, not confirmed new road)
-    2. Aggregate suspicious observations by H3 cell (res 11)
+    2. Aggregate suspicious observations by H3 cell at `resolution` (9, 10 or 11)
     3. Require a cell to have:
        - at least min_observations suspicious fixes
        - at least min_unique_vehicles independent vehicles
@@ -88,10 +89,11 @@ def detect_candidate_map_changes(
     # H3 is the spatial grouping mechanism that heps to identify the candidate regions
     # every fix already carries a cell ID, so "are these fixes near each
     # other?" becomes a plain groupby — no spatial index, no distance query needed.
-    # Two fixes in the same res-11 hexagon (~25 m) are close enough to count as
+    # Two fixes in the same hexagon (~25 m at res 11) are close enough to count as
     # the same location, letting unique vehicle counts accumulate per zone.
+    cell_col = f"h3_cell_res{resolution}"
     agg = (
-        suspicious.groupby("h3_cell_res11")
+        suspicious.groupby(cell_col)
         .agg(
             observations=("vehicle_id", "count"),
             unique_vehicles=("vehicle_id", "nunique"),
@@ -101,7 +103,7 @@ def detect_candidate_map_changes(
             avg_lon=("longitude", "mean"),
         )
         .reset_index()
-        .rename(columns={"h3_cell_res11": "h3_cell"})
+        .rename(columns={cell_col: "h3_cell"})
     )
 
     # Apply multi-vehicle threshold: the key quality gate
@@ -120,6 +122,7 @@ def validate_candidate_change(
     candidate_cells: pd.DataFrame,
     df_with_ground_truth: pd.DataFrame,
     dist_threshold_m: float = 18.0,
+    resolution: int = 11,
 ) -> dict:
     """Compare detected candidates against synthetic ground truth.
 
@@ -131,10 +134,12 @@ def validate_candidate_change(
     if candidate_cells.empty:
         return {"detected": False, "message": "No candidate cells detected."}
 
+    cell_col = f"h3_cell_res{resolution}"
+
     # Which H3 cells contain any candidate_new_road observations?
     true_change_cells = set(
         df_with_ground_truth[df_with_ground_truth["ground_truth_type"] == "candidate_new_road"][
-            "h3_cell_res11"
+            cell_col
         ].unique()
     )
 
@@ -149,7 +154,7 @@ def validate_candidate_change(
     # Unique vehicles with off-road fixes inside detected cells.
     # Excludes normal vehicles that merely passed through the same H3 zone on-road.
     veh_in_detected = df_with_ground_truth[
-        df_with_ground_truth["h3_cell_res11"].isin(detected_cells)
+        df_with_ground_truth[cell_col].isin(detected_cells)
         & (df_with_ground_truth["dist_to_road_m"] > dist_threshold_m)
     ]["vehicle_id"].nunique()
 
