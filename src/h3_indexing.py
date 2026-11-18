@@ -11,7 +11,7 @@ It is used for:
 H3 is NOT:
   - a replacement for road geometry
   - a map-matching algorithm
-  - an exact distance calculator (use PostGIS for that)
+  - an exact distance calculator (use the real road geometry for that)
 
 Resolution guide (approximate cell edge length):
   res 9  ≈  174 m   (city-block scale)

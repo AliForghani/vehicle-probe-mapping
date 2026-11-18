@@ -1,90 +1,180 @@
 # vehicle-probe-spatial-indexing
 
-A Python + PostGIS prototype demonstrating how vehicle GPS/probe data
-is processed, spatially indexed, map-matched, and analyzed to detect candidate road
-network changes — all in a small, locally runnable dataset.
+A Python prototype showing how vehicle GPS/probe data is cleaned, spatially indexed,
+map-matched, and analysed to detect candidate road-network changes — on a small,
+synthetic, locally runnable dataset with an interactive Streamlit dashboard.
 
 ---
 
 ## The Problem
 
-Automotive mapping companies (HERE, TomTom, Apple Maps, Google Maps) continuously
-collect billions of GPS/probe observations from vehicles. From this data they:
+Automotive mapping companies continuously collect billions of GPS/probe observations
+from vehicles. From this data they keep the road map up to date (new roads, geometry
+changes, lane additions), detect speed and congestion patterns, and infer turn
+restrictions and road classes.
 
-- Keep the road map up to date (new roads, geometry changes, lane additions)
-- Detect speed limit changes and congestion patterns
-- Infer turn restrictions and road classifications
-
-**The core challenge:** a single GPS point far from the mapped road could be noise
-or could indicate a real map change. Telling these apart requires spatial indexing,
-statistical aggregation over many independent vehicles, and map matching.
+**The core challenge:** a single GPS fix far from the mapped road could be noise, or
+it could be a sign the map is wrong. Telling these apart requires cleaning, spatial
+aggregation over many independent vehicles, and map matching.
 
 ---
 
-## Architecture
+## Pipeline
 
 ```
-GPS observation
-      │
-      ├── lat/lon → H3 cell ID
-      │             ↓
-      │         aggregation
-      │         partitioning
-      │         neighbourhood analysis
-      │
-      └── POINT geometry → PostGIS
-                            ↓
-                        GiST index
-                            ↓
-                    ST_DWithin
-                    ST_Distance
-                    ST_ClosestPoint
+Raw GPS fixes
+   → glitch filtering        remove single fixes inconsistent with the vehicle's own path
+   → H3 indexing             assign each fix to hexagonal cells (res 9 / 10 / 11)
+   → map matching            which existing road is each fix on? (nearest-road vs HMM)
+   → change detection        is there a road here the map is missing?
 ```
 
-### H3 indexing vs PostGIS/GiST indexing — key distinction
-
-| | H3 | PostGIS + GiST |
-|---|---|---|
-| **What it stores** | Hexagonal cell ID (text) | Actual geometry (POINT, LINESTRING) |
-| **Good for** | Grouping, aggregation, partitioning, density maps | Exact distance, proximity queries, map matching |
-| **Not for** | Precise distance calculation | Coarse spatial partitioning |
-| **Index type** | B-tree on text column | GiST on geometry column |
-| **Example** | "Group all probes by H3 cell, count per cell" | "Find all probes within 100 m of this point" |
-
-**H3 cell assignment ≠ GiST index.**
-
-```
-H3:      GPS point → H3 cell ID → grouping / aggregation / partitioning
-PostGIS: GPS point → geometry  → GiST index → efficient exact spatial queries
-```
+Everything runs in Python: exact distances use the real road geometry (Shapely, in
+metres via UTM); H3 is used only for grouping, never for distances.
 
 ---
 
-## Synthetic Data Scenario — Arlington VA
+## Dashboard Tour
 
-### Mapped road network
-Two roads:
-- **Wilson Blvd** — east-west, ~2.4 km (Courthouse → Ballston)
-- **N Courthouse Rd** — north-south, crosses Wilson Blvd near its midpoint
+| Tab | What it shows |
+|---|---|
+| **1 · Raw Probes** | All fixes before filtering, coloured by the simulation's truth (which real data does not have) |
+| **2 · Filtered** | Fixes kept vs removed, with each removed fix marked by the filter that caught it |
+| **3 · H3 Aggregation** | Unique vehicles and average speed per H3 cell (linked maps), plus the cell table |
+| **4 · Map Matching** | Nearest-road vs HMM side by side for one vehicle, zoomed to the intersection |
+| **5 · Change Detection** | Live detection settings, flagged candidate cells, and a threshold sweep |
 
-The intersection creates a genuine map-matching ambiguity zone: GPS fixes near
-the crossing fall within the search radius of both roads. Nearest-road matching
-may snap to the wrong road there; HMM uses trajectory continuity to stay correct.
+The sidebar holds only the **simulation** settings; change-detection settings live in tab 5
+and apply instantly without re-running the simulation.
 
-### Normal vehicle trajectories
-~80% of vehicles travel approximately along Wilson Blvd with realistic
-GPS noise (σ ≈ 6 m by default).
+---
 
-### Candidate new road
-~20% of vehicles repeatedly travel along a **parallel path ~30 m north** of
-Wilson Blvd. This path does **not exist** in the current road network, simulating
-a new lane, newly constructed road, or changed road geometry.
+## Synthetic Data — Arlington VA
 
-> **Why 30 m?**  
-> A 30 m offset makes the distinction between GPS noise and a real map change
-> easy to visualize and teach. True lane-level map inference often involves
-> separations of 3–5 m, requiring centimetre-precision positioning (RTK-GPS,
-> lidar odometry) and far more sophisticated algorithms.
+### Mapped road network (the "existing map")
+- **Wilson Blvd** — east-west, ~3 km
+- **N Courthouse Rd** — north-south, ~800 m, crossing Wilson near its midpoint
+
+The crossing creates a map-matching ambiguity zone: fixes near it are close to both roads.
+
+### Vehicles
+- **~80%** drive Wilson Blvd; **~20%** drive an **unmapped road** — a copy of Wilson shifted
+  north (30 m by default, adjustable 15–60 m) that is never added to the map.
+- No vehicle drives Courthouse Rd.
+- Each vehicle drives its whole road west → east at its own steady speed (~40 km/h) and
+  records a fixed number of fixes (60 by default) evenly over the trip, so position, time
+  and speed agree.
+- Each fix gets normal (bell-curve) GPS noise, σ = 6 m by default, in both x and y.
+- Each fix is labelled `mapped_road` or `candidate_new_road`. This label is the answer key:
+  it is used **only** to score results, never by the filtering, matching or detection code.
+
+![Tab 1 — raw probes: blue fixes on Wilson Blvd, red fixes on the unmapped road to the north](docs/images/tab1-raw-probes.png)
+
+> **Why such a large offset?** It makes the difference between GPS noise and a real map
+> change easy to see. Real lane-level changes can be 3–5 m and need centimetre-level
+> positioning (RTK-GPS, lidar) and far more sophisticated methods.
+
+---
+
+## GPS Glitch Filtering
+
+*Noise* is the small scatter (a few metres) every fix has around the true position.
+A *glitch* is a fix far off the true position for one or a few readings (multipath,
+tunnels, receiver start-up). The filter removes a fix as a glitch if **either** test catches it,
+and looks only at the **vehicle's own trajectory**, never at the road map:
+
+- **Speed spike** — speed *in* (from the previous fix) **and** speed *out* (to the next fix)
+  are both > 200 km/h, i.e. the fix jumped away and came back. If only one is high, the
+  fix is kept: the neighbour may be the glitch, or there may be a gap in the data.
+- **Isolated jump** — the fix is > 25 m off the straight line between its neighbours, and
+  the neighbours are **not** also off.
+
+Both tests only catch **single** glitched fixes. A run of off-path fixes is kept on purpose —
+it may be a real unmapped road, which is for change detection to judge.
+
+![Tab 2 — kept fixes and the one fix removed as an isolated jump](docs/images/tab2-filtered.png)
+
+---
+
+## Map Matching
+
+Map matching does **not** question the map: it takes the existing roads as given and decides
+which road each fix belongs to.
+
+1. **Candidates** — roads within a search radius (60 m) of the fix. This demo checks every
+   road; production uses a spatial index (see below).
+2. **Nearest-road (baseline)** — each fix goes to its closest road, one fix at a time. Can
+   pick the wrong road near intersections, parallel roads and ramps.
+3. **HMM / Viterbi** — picks the most likely *sequence* of roads for the whole trajectory:
+
+```
+Hidden states   = which road the vehicle is on
+Observations    = noisy GPS fixes
+Emission        ∝ Gaussian(distance from fix to road)
+Transition      ∝ exp(-|snap-to-snap distance − GPS distance| / beta)
+                  (straight-line distances in this demo; production uses the
+                   distance along the road network)
+```
+
+The dashboard shows one vehicle, chosen because the two methods disagree on it; for most
+vehicles they agree. The demo does not measure matching accuracy.
+
+![Tab 4 — the circled fix sits on Courthouse Rd: nearest-road snaps it there (left), HMM keeps it on Wilson Blvd (right)](docs/images/tab4-map-matching.png)
+
+---
+
+## Change Detection
+
+Two major steps:
+
+1. **Find suspicious fixes** — fixes farther than a threshold from the **closest** mapped road.
+   A good default threshold is **3σ of the GPS noise**: about 99.7% of on-road fixes fall
+   within it, so only ~0.3% are flagged by chance.
+2. **Group and require independent support** — group suspicious fixes into H3 cells and flag
+   a cell as a **candidate change** only if it has at least N suspicious fixes from at least M
+   **unique vehicles**. One vehicle off-road is likely noise; many independent vehicles in the
+   same place is evidence.
+
+Only *after* detection are candidates compared with the answer key (true-change vs
+false-positive cells). Tab 5 includes a threshold sweep showing that trade-off.
+
+**Known blind spot:** distance is to the closest road, whichever it is. Where the unmapped road
+crosses Courthouse Rd, its fixes look on-road, leaving a gap in the detected cells.
+
+![Tab 5 — detection settings, metrics and candidate cells (red stars) along the unmapped road, zoomed near the intersection](docs/images/tab5-change-detection.png)
+
+In the screenshot: the red stars break where the unmapped road crosses Courthouse Rd (the
+blind spot), and the few scattered orange fixes below Wilson are on-road noise that the
+multi-vehicle rule correctly ignores.
+
+A candidate is still **not** a mapped road — validation and map update are not part of this demo.
+
+---
+
+## Production Notes
+
+What a production system would add beyond this demo:
+
+- **Spatial database & index** — road and probe geometry in **PostGIS** with a **GiST index**
+  (or an R-tree in Python, e.g. `roads_gdf.sindex`), so proximity queries such as
+  `ST_DWithin` stay fast at millions of roads.
+- **Map matching** — run on every trajectory (trips split at time gaps first), use
+  road-network distance plus heading, speed, one-way and turn rules, measure accuracy on
+  labelled drives, and output a confidence per match.
+- **Change detection** — use poor or failed matches (or heading) as the suspicious signal
+  instead of raw closest-road distance; require persistence over days/weeks and a
+  consistent direction of travel; set thresholds from measured noise on known roads.
+- **Validation & update** — review candidates (imagery, human editors) before adding a road
+  in the next map release.
+
+```
+Vehicle telemetry
+   → stream ingestion (Kafka / Kinesis)      → schema validation
+   → quality filtering                        → time + H3 partitioning
+   → distributed storage (Parquet on S3)      → trajectory reconstruction
+   → map matching (Spark / OSRM / Valhalla)   → spatial aggregation (H3)
+   → change detection                         → validation → incremental map update
+```
 
 ---
 
@@ -92,22 +182,16 @@ a new lane, newly constructed road, or changed road geometry.
 
 ```
 vehicle-probe-mapping/
-├── app.py                 Streamlit dashboard (entry point)
-├── docker-compose.yml     PostGIS container
+├── app.py                  Streamlit dashboard (entry point)
 ├── requirements.txt
+├── docs/images/            Dashboard screenshots used in this README
 ├── src/
-│   ├── generate_data.py   Synthetic road network + probe generation
-│   ├── preprocessing.py   GPS cleaning and derived fields
-│   ├── h3_indexing.py     H3 cell assignment and aggregation
-│   ├── database.py        PostGIS load/query helpers
-│   ├── spatial_queries.py ST_DWithin, residuals, aggregation
-│   ├── map_matching.py    Nearest-road + HMM/Viterbi matcher
-│   ├── change_detection.py Distance residuals + candidate detection
-│   └── visualization.py   Interactive Plotly figures for Streamlit
-├── sql/
-│   ├── create_tables.sql
-│   ├── create_indexes.sql
-│   └── example_queries.sql
+│   ├── generate_data.py    Synthetic road network + probe generation
+│   ├── preprocessing.py    Cleaning, derived speed, glitch filtering
+│   ├── h3_indexing.py      H3 cell assignment and aggregation
+│   ├── map_matching.py     Nearest-road + HMM/Viterbi matcher
+│   ├── change_detection.py Distance to road + candidate detection + validation
+│   └── visualization.py    Interactive Plotly figures
 └── tests/
     ├── test_preprocessing.py
     ├── test_h3.py
@@ -115,46 +199,11 @@ vehicle-probe-mapping/
     └── test_change_detection.py
 ```
 
----
-
 ## How to Run
-
-### Streamlit dashboard
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
-```
-
-### With PostGIS (full pipeline)
-
-```bash
-docker compose up -d
-python -c "
-from src.database import get_engine, create_tables, create_spatial_indexes, \
-     load_probes_to_postgis, load_roads_to_postgis
-from src.generate_data import generate_road_network, generate_probe_data
-from src.preprocessing import preprocess_probes, filter_gps_noise
-from src.h3_indexing import add_h3_cells
-
-roads = generate_road_network()
-raw   = generate_probe_data(roads)
-pre   = preprocess_probes(raw)
-clean, _ = filter_gps_noise(pre)
-h3    = add_h3_cells(clean)
-
-engine = get_engine()
-create_tables(engine)
-create_spatial_indexes(engine)
-load_roads_to_postgis(roads, engine)
-load_probes_to_postgis(h3, engine)
-print('Loaded.')
-"
-```
-
-### Tests
-
-```bash
 pytest tests/ -v
 ```
 
@@ -164,17 +213,17 @@ pytest tests/ -v
 
 | Function | Module | Purpose |
 |---|---|---|
-| `generate_road_network()` | generate_data | Mapped road as GeoDataFrame |
+| `generate_road_network()` | generate_data | Mapped roads as a GeoDataFrame |
 | `generate_probe_data()` | generate_data | Synthetic vehicle GPS traces |
-| `preprocess_probes()` | preprocessing | Clean, sort, derive dt/dist/speed |
-| `filter_gps_noise()` | preprocessing | Remove impossible-speed / isolated jumps |
+| `preprocess_probes()` | preprocessing | Clean, sort, derive time/distance/speed |
+| `filter_gps_noise()` | preprocessing | Remove speed-spike / isolated-jump glitches |
 | `add_h3_cells()` | h3_indexing | Assign H3 res 9/10/11 cell IDs |
-| `aggregate_by_h3()` | h3_indexing | Count obs/vehicles/speed per cell |
-| `query_nearby_probes()` | spatial_queries | ST_DWithin proximity query |
-| `calculate_road_residuals()` | change_detection | Distance + nearest road ID per obs |
-| `detect_candidate_map_changes()` | change_detection | Multi-vehicle off-road aggregation |
+| `aggregate_by_h3()` | h3_indexing | Observations / vehicles / speed per cell |
 | `map_match_nearest()` | map_matching | Baseline nearest-road snap |
 | `map_match_trajectory()` | map_matching | HMM / Viterbi trajectory matching |
+| `calculate_road_residuals()` | change_detection | Distance to closest road per fix |
+| `detect_candidate_map_changes()` | change_detection | Multi-vehicle candidate cells |
+| `validate_candidate_change()` | change_detection | Score candidates against the answer key |
 
 ---
 
@@ -186,167 +235,20 @@ pytest tests/ -v
 | 10 | ~66 m | Intersection-level aggregation |
 | 11 | ~25 m | Approximate lane-level grouping |
 
-Resolution 11 is an **illustrative** choice for this prototype.
-It is **not** a universal automotive standard.
+Resolution 11 is an **illustrative** choice, not a universal standard.
 
----
-
-## Map Matching
-
-### Baseline: nearest road
-For each GPS point independently, find the geometrically closest road segment.
-Fast but fails near intersections — a fix near the Wilson/Courthouse crossing
-may snap to the wrong road because both are within the search radius.
-
-The dashboard (Tab 4) shows this failure directly: one fix snaps to N Courthouse Rd
-(red snap line) instead of staying on Wilson Blvd.
-
-### HMM / Viterbi trajectory-aware matching
-
-```
-Hidden Markov Model
-
-Hidden states   = which road segment the vehicle is actually on
-Observations    = noisy GPS fixes
-
-Emission prob   = P(GPS point | road segment)
-                  ∝ Gaussian(distance to road)
-
-Transition prob = P(road_t | road_{t-1})
-                  ∝ exp(-|route_distance - GPS_distance| / beta)
-
-Viterbi selects the most-likely road SEQUENCE, not greedy best-per-point.
-```
-
----
-
-## GPS Noise vs Real Map Change
-
-### Two deliberately separate questions
-
-**GPS noise filtering** asks:
-> "Is this observation inconsistent with the **vehicle's own trajectory**?"
-
-Looks only at the vehicle's internal sequence — arrival speed, departure speed,
-perpendicular deviation from the local prev→next segment.
-Does **not** use distance from the road map.
-
-**Map-change detection** asks:
-> "Are many reliable vehicle trajectories consistently inconsistent with the **existing map**?"
-
-Uses road distance as the signal, after noise has already been removed.
-
-Keeping these separate prevents the noise filter from erasing the very evidence
-the change detector needs.  A vehicle consistently 30 m from the mapped road is
-noise-filtered first (trajectory-internally consistent → kept), then aggregated
-with other vehicles' trajectories to decide whether it represents a real change.
-
-### GPS noise filter: two tests
-
-**Test 1 — GPS speed outlier**
-
-An erroneous middle fix causes the calculated speed from the previous fix to it,
-and from it to the next fix, to become unrealistically high compared with the
-surrounding trajectory.
-
-A fix is flagged when:
-- speed from previous fix to current fix > threshold  AND
-- speed from current fix to next fix > threshold
-
-Requiring both conditions avoids removing a legitimate fix where only the speed
-from the previous fix is high (e.g. a long sampling gap after a fast road section).
-
-**Test 2 — isolated local trajectory outlier**
-```
-perpendicular distance from fix to prev→next segment > threshold
-AND neighbours are NOT similarly displaced  →  remove
-```
-Only applied when both time gaps to neighbours are small (configurable).
-If neighbours are also displaced, the fix is part of a persistent cluster → preserved.
-
-### Evidence strength
-
-```
-one vehicle + one unusual fix        → likely GPS noise
-
-many independent vehicles
-+ same spatial deviation (> threshold)
-+ repeated over multiple time windows
-+ consistent direction of travel     → candidate map change
-```
-
----
-
-## Automotive-Scale Architecture
-
-```
-Vehicle telemetry
-      ↓
-Stream ingestion         Kafka / Kinesis / Pub/Sub
-      ↓
-Schema validation        Protobuf / Avro schema registry
-      ↓
-Quality filtering        Bad coordinates, impossible speed, duplicate detection
-      ↓
-Time + geo partitioning  Partition by date + H3 res 5–7 region
-      ↓
-Distributed storage      Parquet on S3 / GCS / ADLS
-      ↓
-Trajectory reconstruction  Group by vehicle_id, sort by time
-      ↓
-Map matching             Valhalla / OSRM / custom HMM at scale (Spark)
-      ↓
-Spatial aggregation      H3 hexagon counts, speed, heading
-      ↓
-Change detection         Multi-vehicle, multi-time-window aggregation
-      ↓
-Validation               Compare against known ground truth / surveyed data
-      ↓
-Incremental map update   Candidate → review → merge
-```
-
-Key principles at scale:
-- Partition by H3 cell to avoid global spatial joins
-- Idempotent pipeline: re-processing a partition produces identical output
-- Separate streaming (Kafka) and batch (Spark) paths
-- Data quality monitoring at ingest
-
-This prototype processes thousands of records locally.
-At production scale the same logical pipeline runs on Spark/Databricks with
-H3-partitioned Parquet files.
-
----
-
-## GPS Noise vs New Road
-
-| Evidence | Interpretation |
-|---|---|
-| 1 vehicle, 1 fix 30 m off road | GPS multipath — noise |
-| 1 vehicle, every fix 30 m off road | Driver off-road or map error |
-| 20 vehicles, every fix ~30 m off road, same direction | Candidate new road |
-
-Signals considered: distance from road, unique vehicle count (independent),
-heading consistency, persistence across time windows, spatial clustering.
-
----
-
-## Map Matching
-
-1. Find candidate road segments within search radius (ST_DWithin)
-2. Score each candidate: Gaussian emission model on perpendicular distance
-3. Viterbi over full trajectory: select most-likely road sequence, not greedy per-point
+![Tab 3 — unique vehicles (top) and average speed (bottom) per H3 cell](docs/images/tab3-h3-aggregation.png)
 
 ---
 
 ## Limitations
 
-- Dataset is **synthetic**.
-- Candidate road is intentionally **25–40 m** offset for clarity. Real lane-level
-  changes can be 3–5 m and require RTK-GPS or lidar.
-- H3 resolution 11 is **illustrative** — not a universal standard.
-- H3 is **not** a replacement for road geometry.
-- H3 and GiST solve **different problems** and both are needed.
-- HMM map matching here is **simplified** (no heading model, no road class prior).
-- Real automotive localisation uses IMU, wheel odometry, and lidar.
-- Production fleet-scale processing requires distributed infrastructure.
-- Real map updates require human review and stronger statistical validation.
+- The dataset is **synthetic** and clean: bell-curve noise only, no real glitches, no turning
+  vehicles, and a single point in time (no persistence over days).
+- The unmapped road is offset far more than real lane changes, for clarity.
+- HMM matching is **simplified** (straight-line transitions, no heading model, no road-class prior)
+  and is shown on one vehicle without an accuracy measure.
+- Change detection uses closest-road distance, not the map-matching result.
+- Validation is lenient: a flagged cell counts as correct if it contains any unmapped-road fix.
+- Real automotive positioning also uses IMU, wheel odometry and lidar; real map updates need
+  human review and stronger statistical validation.

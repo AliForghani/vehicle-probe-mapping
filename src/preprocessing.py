@@ -32,7 +32,7 @@ _TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32618", always_xy=True)
 # Defaults — all configurable via filter_gps_noise() parameters
 LAT_MIN, LAT_MAX   = -90.0, 90.0
 LON_MIN, LON_MAX   = -180.0, 180.0
-MAX_SPEED_KMH      = 250.0   # conservative configurable threshold for detecting implausible jumps in this demo
+MAX_SPEED_KMH      = 200.0   # implausible for an urban arterial; production would set this per road class
 MAX_TIME_GAP_S     = 30.0    # seconds; don't apply local-geometry test across gaps
 LOCAL_OUTLIER_M    = 25.0    # metres; perpendicular deviation from prev→next segment
 

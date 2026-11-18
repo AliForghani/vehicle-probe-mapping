@@ -23,7 +23,7 @@ st.set_page_config(
 st.title("🗺️ Vehicle Probe Spatial Indexing")
 st.markdown(
     "**GPS noise vs candidate map change** — Arlington VA synthetic dataset  \n"
-    "Uses H3 for aggregation and PostGIS geometry for precise spatial operations."
+    "Uses H3 for aggregation and exact road geometry (in metres) for distances — all in Python."
 )
 
 # ── Sidebar controls ───────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ st.sidebar.caption("Change-detection settings are in the **5 · Change Detection
 with st.sidebar.expander("ℹ️ How the data is simulated"):
     st.markdown("""
 **1. The map** has two existing roads:
-- **Wilson Blvd**, running about 2.4 km east–west.
+- **Wilson Blvd**, running about 3 km east–west.
 - **N Courthouse Rd**, about 800 m north–south, crossing Wilson near the middle.
 
 **2. A hidden unmapped road** is a copy of Wilson Blvd shifted **north** by the offset
@@ -49,11 +49,13 @@ slider (30 m by default). It runs the full length of Wilson and is **never added
 **3. The vehicles:**
 - The "% vehicles on unmapped new road" slider decides how many drive the hidden road
   (20% by default). The rest drive Wilson Blvd. **No vehicle drives Courthouse Rd.**
-- Each vehicle gets a fixed number of GPS fixes (60 by default), placed at random points
-  along its road, in order from west to east.
+- Each vehicle drives its whole road west → east at its own steady speed (about 40 km/h)
+  and records a fixed number of GPS fixes (60 by default) evenly over the trip — about
+  every 4–5 s at the defaults.
 - Each fix gets random GPS error: a normal (bell-curve) offset with a standard deviation
   of 6 m by default, in both x and y.
-- Each fix also gets a speed of about 40 km/h, a heading, and a timestamp 2 seconds apart.
+- Each fix also gets a reported speed, a heading, and a timestamp that matches where the
+  vehicle is — so position, time and speed agree.
 - Each fix is tagged with its true label, `mapped_road` or `candidate_new_road`.
   That's the answer key.
 """)
@@ -91,22 +93,45 @@ if run_btn:
         # runs live in the Change Detection tab so its settings apply instantly.
         residual_df = calculate_road_residuals(h3_df, roads_gdf)
 
-        # Pick the Wilson Blvd vehicle with the most fixes near the intersection
-        # (lon ≈ -77.0645). Use nearest_road_id from residual_df — no ground truth needed.
-        INTERSECTION_LON = -77.0645
+        # ── Pick the sample vehicle for the Map Matching tab ──────────────────
+        # Goal: a vehicle on Wilson Blvd where the two methods actually DISAGREE.
+        # Uses only distances and matcher outputs — no ground truth.
         wilson_road_id = roads_gdf[roads_gdf["road_name"].str.contains("Wilson")]["road_id"].iloc[0]
-        wilson_fixes = residual_df[residual_df["nearest_road_id"] == wilson_road_id]
-        fixes_near = wilson_fixes.groupby("vehicle_id").apply(
-            lambda g: (abs(g["longitude"] - INTERSECTION_LON) < 0.005).sum()
+
+        # 1. On-road vehicles: their fixes are typically within a few metres of a road
+        #    (vehicles on the unmapped road sit ~offset metres away).
+        median_dist = residual_df.groupby("vehicle_id")["dist_to_road_m"].median()
+        on_road_vids = median_dist[median_dist < 10.0].index
+
+        # 2. Candidates: on-road vehicles with fixes whose closest road is NOT Wilson
+        #    (i.e. nearest-road would snap them to the cross street). Most such fixes first.
+        on_road = residual_df[residual_df["vehicle_id"].isin(on_road_vids)]
+        cross_counts = (
+            on_road[on_road["nearest_road_id"] != wilson_road_id]
+            .groupby("vehicle_id").size().sort_values(ascending=False)
         )
-        sample_vid = fixes_near.idxmax()
+        candidates = list(cross_counts.index[:10])
+        if not candidates:  # no close calls this run — fall back to any on-road vehicle
+            candidates = list(on_road_vids[:1]) or [residual_df["vehicle_id"].iloc[0]]
 
-        
-        sample_df = cleaned_df[cleaned_df["vehicle_id"] == sample_vid]
+        # 3. Run both matchers on the candidates; keep the one with most disagreements
+        #    (nearest-road says cross street, HMM says Wilson).
+        best = None
+        for vid in candidates:
+            vdf = cleaned_df[cleaned_df["vehicle_id"] == vid]
+            m_near = map_match_nearest(vdf, roads_gdf)
+            m_hmm = map_match_trajectory(vdf, roads_gdf)
+            both = m_near[["timestamp", "matched_road_id"]].merge(
+                m_hmm[["timestamp", "hmm_matched_road_id"]], on="timestamp"
+            )
+            n_disagree = int((
+                (both["matched_road_id"] != wilson_road_id)
+                & (both["hmm_matched_road_id"] == wilson_road_id)
+            ).sum())
+            if best is None or n_disagree > best[0]:
+                best = (n_disagree, vid, vdf, m_near, m_hmm)
 
-        # now input one vehicle fixes
-        matched_df     = map_match_nearest(sample_df, roads_gdf)
-        hmm_matched_df = map_match_trajectory(sample_df, roads_gdf)
+        n_disagree, sample_vid, sample_df, matched_df, hmm_matched_df = best
 
         # Store everything in session_state so re-runs (radio clicks, tab switches)
         # don't reset back to the landing page
@@ -119,6 +144,7 @@ if run_btn:
             h3_agg=h3_agg,
             residual_df=residual_df,
             sample_vid=sample_vid,
+            n_disagree=n_disagree,
             sample_df=sample_df,
             matched_df=matched_df,
             hmm_matched_df=hmm_matched_df,
@@ -190,8 +216,32 @@ if st.session_state["results"] is not None:
     with tab2:
         st.markdown(
             "**Blue** = kept after noise filter  \n"
-            "**Red ×** = removed (impossible speed or isolated jump)"
+            "**Red ×** = removed by speed spike · **Purple ◆** = removed by isolated jump · "
+            "**Black ★** = removed by both"
         )
+        st.markdown("""
+**Noise vs glitch** — *noise* is the small scatter (a few metres) every GPS fix has around the
+true position. A *glitch* is a fix whose position is **far off** where the car really was — tens
+to hundreds of metres or more — for one or a few readings (signals bouncing off buildings,
+tunnels, receiver start-up). A fix is treated as a glitch and removed if **either** of two
+filters catches it: **speed spike** or **isolated jump** (below). Everyday noise is kept.
+
+**Filters used** — each fix is checked against the vehicle's **own trajectory**, not the road map:
+- **Basic cleaning** — drop missing or impossible coordinates (e.g. 0,0) and exact duplicates.
+  These have no usable position, so they are not shown on the map.
+- **Speed spike** — removed if the implied speed is > 200 km/h **both** from the previous fix
+  and to the next fix (a single jump out and back).
+  *Speed in* = straight-line distance (metres) from the previous fix to this fix ÷ time between
+  them; *speed out* = the same from this fix to the next fix.
+  If only **one** of the two is high, we can't say this fix is the glitch — the neighbour may be,
+  or there may be a gap in the data — so the fix is kept.
+- **Isolated jump** — removed if it lies > 25 m off the straight line between its previous and
+  next fix **and** its neighbours are not also off (one stray point, not a real path change).
+
+⚠️ Both filters only catch **single** glitched fixes. A run of several off-path fixes in a row is
+kept on purpose: it may be a real path the map doesn't have (e.g. an unmapped road), which is
+for change detection to judge — not something to delete as noise.
+""")
         show(plot_filtered_probes(r["cleaned_df"], r["removed_df"], r["roads_gdf"]))
 
     with tab3:
@@ -244,12 +294,27 @@ if st.session_state["results"] is not None:
             "below.  \n"
             "Discovering *new* roads is a separate step — see **5 · Change Detection**."
         )
+        n_dis = r.get("n_disagree", 0)
+        if n_dis > 0:
+            pick_note = (
+                f"This vehicle was **chosen because the two methods disagree** on it "
+                f"({n_dis} fix{'es' if n_dis != 1 else ''}: nearest-road says Courthouse, HMM says "
+                "Wilson). For most vehicles they agree.  \n"
+            )
+        else:
+            pick_note = (
+                "⚠️ In this run no vehicle showed a disagreement between the two methods, so both "
+                "panels look the same. Change a simulation setting (e.g. more vehicles or more GPS "
+                "noise) and run again.  \n"
+            )
         st.markdown(
             f"**Vehicle `{r['sample_vid']}`** travels east along Wilson Blvd and passes "
             f"through the N Courthouse Rd intersection (lon ≈ −77.0645).  \n"
-            "Near the intersection, GPS fixes fall within the search radius of **both** roads.  \n"
+            + pick_note +
+            "Near the intersection, GPS fixes fall within the search radius of **both** roads. "
+            "The chart opens zoomed on the fix where the methods disagree (red circle).  \n"
             "**Left:** nearest-road matcher — may snap to the cross street (red lines = wrong road).  \n"
-            "**Right:** HMM / Viterbi — trajectory continuity keeps it on Wilson Blvd (all-green = correct)."
+            "**Right:** HMM / Viterbi — trajectory continuity keeps it on Wilson Blvd (green = correct)."
         )
         show(plot_matching_comparison(
             r["sample_df"], r["matched_df"], r["hmm_matched_df"], r["roads_gdf"], r["sample_vid"]
@@ -302,31 +367,13 @@ looks fine, but a car would really have to drive to an interchange and back — 
 
         with st.expander("ℹ️ Find candidate roads with a spatial index"):
             st.markdown("""
-**In production:** find candidate roads with a spatial index (PostGIS GiST / R-tree) instead of
-checking every road.
+For each fix, the matcher first needs the roads in a specified proximity, for example within
+60 m. This demo checks **every road**,
+which is fine for 2 roads but far too slow for millions. A spatial index (tree of nested
+boxes) skips most of the map in a few steps, so only nearby roads get an exact distance check.
 
-Before scoring roads for a GPS fix, the matcher needs a shortlist of **candidate roads** —
-those within the search radius (60 m here).
-
-**What this demo does** — for every fix, loops over **every road** and computes the exact
-distance. Instant with 2 roads, but a real network has millions of road segments and you would
-run this for billions of fixes — far too slow.
-
-**What a spatial index does** — like a phone book for locations: roads are grouped into a tree
-of nested boxes (big regions → smaller areas → individual roads). To find roads near a fix:
-1. Draw a 60 m box around the fix.
-2. Walk down the tree, skipping every box that doesn't overlap it — most of the map is ruled
-   out in a few steps.
-3. Compute exact distances only for the handful of roads left.
-
-Work per fix drops from millions of distance checks to a few lookups (O(n) → O(log n)).
-
-**Where you'd use it**
-- **Database:** PostGIS with a **GiST index** on the road geometry, queried with
-  `ST_DWithin(road.geom, fix.geom, 60)` — see the project's `sql/` folder.
-- **Python:** an **R-tree**, e.g. `roads_gdf.sindex` (GeoPandas) or Shapely's `STRtree`.
-
-**In this project:** only 2 roads, so the simple loop is fine.
+- **Database:** PostGIS **GiST index** + `ST_DWithin(road.geom, fix.geom, 60)`.
+- **Python:** an **R-tree**, e.g. `roads_gdf.sindex` or Shapely's `STRtree`.
 """)
 
         with st.expander("ℹ️ Split trips before matching"):
@@ -352,7 +399,7 @@ road sequences.
   usually means ignition off; a long stationary period also counts as a stop.
 
 **In this project:** no trip splitting and no ignition field — each synthetic vehicle is one
-continuous drive with fixes 2 s apart, so it isn't needed here.
+continuous drive with fixes a few seconds apart, so it isn't needed here.
 """)
 
     with tab5:
@@ -494,12 +541,11 @@ else:
 
 | Concept | What it does here |
 |---|---|
+| **GPS glitch filtering** | Removes single fixes that jump impossibly far from the vehicle's own path |
 | **H3 indexing** | Assigns every GPS fix to a hexagonal cell for grouping/aggregation |
-| **PostGIS geometry** | Stores exact POINT geometry; used for `ST_DWithin`, `ST_Distance`, `ST_ClosestPoint` |
-| **GiST spatial index** | Accelerates proximity queries from O(n) to O(log n) |
 | **Nearest-road matching** | Baseline: snap each GPS point to closest road |
 | **HMM map matching** | Considers whole trajectory; picks most-likely road sequence via Viterbi |
-| **Change detection** | Flags H3 cells with persistent multi-vehicle off-road deviation |
+| **Change detection** | Flags H3 cells where many independent vehicles are off the mapped road |
 
 ### GPS noise vs real map change
 
@@ -525,4 +571,8 @@ Vehicle telemetry
     → change detection
     → validation → incremental map update
 ```
+
+In production, road and probe geometry would typically live in a spatial database such as
+**PostGIS**, with a **GiST spatial index** so proximity queries (`ST_DWithin`, `ST_Distance`)
+stay fast at scale. This demo does the same calculations in Python on a small dataset.
 """)

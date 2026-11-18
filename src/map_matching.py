@@ -30,6 +30,7 @@ from shapely.ops import nearest_points
 logger = logging.getLogger(__name__)
 
 _TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32618", always_xy=True)
+_TO_WGS = Transformer.from_crs("EPSG:32618", "EPSG:4326", always_xy=True)
 
 
 @dataclass
@@ -56,9 +57,7 @@ def _point_to_road_dist(pt: Point, road: LineString) -> tuple[float, Point]:
     closest_utm = nearest_points(road_utm, pt_utm)[0]
     dist = pt_utm.distance(closest_utm)
     # Back-project closest point to WGS84
-    lon, lat = Transformer.from_crs("EPSG:32618", "EPSG:4326", always_xy=True).transform(
-        closest_utm.x, closest_utm.y
-    )
+    lon, lat = _TO_WGS.transform(closest_utm.x, closest_utm.y)
     return dist, Point(lon, lat)
 
 

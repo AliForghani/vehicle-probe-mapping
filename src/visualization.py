@@ -117,14 +117,51 @@ def plot_filtered_probes(
     removed: pd.DataFrame,
     roads_gdf: gpd.GeoDataFrame,
 ) -> go.Figure:
-    """Map 2: cleaned vs removed GPS noise observations."""
+    """Map 2: cleaned vs removed GPS noise observations, removed ones split by filter."""
     fig = _base_figure("Preprocessing Filter: Kept vs Removed", roads_gdf)
     fig.add_trace(_points(cleaned, name="Kept",
                           marker=dict(size=4, color=BLUE, opacity=0.4)))
-    if not removed.empty:
-        fig.add_trace(_points(removed, name="Removed (noise)",
-                              marker=dict(size=8, color="red", symbol="x")))
     _add_roads(fig, roads_gdf)
+
+    if removed.empty:
+        return fig
+
+    # One layer per filter (noise_reason from preprocessing.filter_gps_noise),
+    # each with its own colour AND symbol so it reads without colour too.
+    reasons = [
+        ("unrealistic_speed_between_consecutive_fixes", "Removed: speed spike (> 200 km/h in and out)",
+         "#D62728", "x"),
+        ("isolated_local_trajectory_outlier", "Removed: isolated jump (> 25 m off own path)",
+         "#7B3FBF", "diamond"),
+        ("multiple_flags", "Removed: both filters", "black", "star"),
+    ]
+    reason_col = removed["noise_reason"] if "noise_reason" in removed.columns else None
+    for key, label, color, symbol in reasons:
+        sub = removed[reason_col == key] if reason_col is not None else removed.iloc[0:0]
+        if sub.empty:
+            continue
+        cols = [c for c in ("vehicle_id", "derived_speed_kmh", "next_speed_kmh",
+                            "local_trajectory_residual_m") if c in sub.columns]
+        hover = label + "<br>vehicle %{customdata[0]}"
+        if "derived_speed_kmh" in cols:
+            hover += "<br>speed in %{customdata[1]:.0f} km/h<br>speed out %{customdata[2]:.0f} km/h"
+        if "local_trajectory_residual_m" in cols:
+            hover += f"<br>off own path %{{customdata[{cols.index('local_trajectory_residual_m')}]:.1f}} m"
+        fig.add_trace(go.Scatter(
+            x=sub["longitude"], y=sub["latitude"], mode="markers", name=label,
+            marker=dict(size=10, color=color, symbol=symbol, line=dict(color="white", width=1)),
+            customdata=sub[cols].values,
+            hovertemplate=hover + "<extra></extra>",
+        ))
+
+    # Anything without a recognised reason (shouldn't happen) still gets drawn.
+    if reason_col is not None:
+        other = removed[~reason_col.isin([k for k, *_ in reasons])]
+    else:
+        other = removed
+    if not other.empty:
+        fig.add_trace(_points(other, name="Removed (noise)",
+                              marker=dict(size=8, color="red", symbol="x")))
     return fig
 
 
@@ -292,11 +329,44 @@ def plot_matching_comparison(
     fig.update_xaxes(title="Longitude", showgrid=True, gridcolor="#eee", zeroline=False)
     fig.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=False)
     fig.update_yaxes(title="Latitude", row=1, col=1)
+    # Fixes where the two methods pick different roads.
+    near = matched_df[matched_df["vehicle_id"] == vehicle_id][["timestamp", "longitude", "latitude",
+                                                               "matched_road_id"]]
+    hmm = hmm_df[hmm_df["vehicle_id"] == vehicle_id][["timestamp", "hmm_matched_road_id"]]
+    both = near.merge(hmm, on="timestamp")
+    disagree = both[both["matched_road_id"] != both["hmm_matched_road_id"]]
+
+    # Open zoomed in where it matters: the difference is a few metres and invisible
+    # at full-road zoom. Double-click resets to the full road.
+    if not disagree.empty:
+        cx, cy = disagree["longitude"].iloc[0], disagree["latitude"].iloc[0]
+        half_x, half_y = 0.0005, 0.0004            # ≈ ±45 m
+        zoom_txt = "zoomed to where the methods disagree"
+        for col in (1, 2):
+            fig.add_trace(go.Scatter(
+                x=disagree["longitude"], y=disagree["latitude"], mode="markers",
+                name="Methods disagree here", legendgroup="disagree", showlegend=(col == 1),
+                marker=dict(size=22, color="rgba(0,0,0,0)", line=dict(color="#D62728", width=2)),
+                hovertemplate="methods disagree on this fix<extra></extra>",
+            ), row=1, col=col)
+    else:
+        ix = (roads_gdf.geometry.iloc[0].intersection(roads_gdf.geometry.iloc[1])
+              if len(roads_gdf) > 1 else None)
+        if ix is not None and not ix.is_empty:
+            cx, cy = ix.centroid.x, ix.centroid.y
+        else:
+            cx, cy = both["longitude"].mean(), both["latitude"].mean()
+        half_x, half_y = 0.0015, 0.0012            # ≈ ±130 m
+        zoom_txt = "zoomed to intersection"
+    fig.update_xaxes(range=[cx - half_x, cx + half_x])
+    fig.update_yaxes(range=[cy - half_y, cy + half_y])
+
     fig.update_layout(
-        title=dict(text=f"Map Matching — Vehicle {vehicle_id}", font=dict(size=15)),
-        height=550,
-        margin=dict(l=10, r=10, t=70, b=10),
-        legend=dict(orientation="h", x=0, y=-0.15, font=dict(size=11)),
+        title=dict(text=f"Map Matching — Vehicle {vehicle_id} ({zoom_txt} — "
+                        "double-click to see full road)", font=dict(size=15)),
+        height=580,
+        margin=dict(l=10, r=10, t=70, b=90),
+        legend=dict(orientation="h", x=0, y=-0.22, font=dict(size=11)),
         dragmode="pan",
         hovermode="closest",
         plot_bgcolor="white",

@@ -46,7 +46,7 @@ def generate_road_network() -> gpd.GeoDataFrame:
     """Return a GeoDataFrame of the existing mapped road segments.
 
     Two roads:
-      1. Wilson Blvd       — east-west, ~2.4 km (Courthouse → Ballston)
+      1. Wilson Blvd       — east-west, ~3 km (Courthouse → Ballston)
       2. N Courthouse Rd   — north-south, crosses Wilson Blvd near its midpoint
 
     The cross street creates a genuine map-matching ambiguity zone:
@@ -135,17 +135,31 @@ def generate_probe_data(
     records: list[dict] = []
 
     def _add_vehicle(vid: int, line: LineString, label: str) -> None:
-        # Vehicles travel in order along the line (increasing fraction)
-        fractions = np.sort(rng.uniform(0.0, 1.0, points_per_vehicle))
-        for i, frac in enumerate(fractions):
-            pt = line.interpolate(frac, normalized=True)
-            lon_clean, lat_clean = pt.x, pt.y
+        # Each vehicle actually drives the full line west → east at its own steady
+        # speed, so positions, timestamps and speed agree. (Placing fixes at random
+        # positions with fixed time steps created fake >250 km/h jumps that the
+        # speed-spike filter then removed.)
+        line_utm = LineString([_TO_UTM.transform(x, y) for x, y in line.coords])
+        length_m = line_utm.length
+
+        speed_kmh = max(25.0, float(rng.normal(40.0, 5.0)))
+        speed_ms = speed_kmh / 3.6
+        trip_s = length_m / speed_ms
+
+        # Sampling interval chosen so the fixes span the whole trip, with ±10%
+        # jitter per step like a real receiver; rescaled so the trip ends at the end.
+        dts = rng.uniform(0.9, 1.1, points_per_vehicle - 1) * trip_s / max(points_per_vehicle - 1, 1)
+        t = np.concatenate([[0.0], np.cumsum(dts)])
+        t = t * trip_s / t[-1] if t[-1] > 0 else t
+        trip_start = start_time + timedelta(seconds=vid * 300)
+
+        for i, t_i in enumerate(t):
+            pt = line_utm.interpolate(min(speed_ms * t_i, length_m))
 
             # Add metric noise in UTM, compute heading while still in UTM,
             # then convert to WGS84 once at the end
-            utm_x, utm_y = _TO_UTM.transform(lon_clean, lat_clean)
-            utm_x += rng.normal(0, noise_std_m)
-            utm_y += rng.normal(0, noise_std_m)
+            utm_x = pt.x + rng.normal(0, noise_std_m)
+            utm_y = pt.y + rng.normal(0, noise_std_m)
 
             if i == 0:
                 heading = 90.0  # start heading east
@@ -157,11 +171,10 @@ def generate_probe_data(
 
             lon_noisy, lat_noisy = _TO_WGS.transform(utm_x, utm_y)
 
-            # Approximate speed: ~40 km/h with small variation
-            speed = float(rng.normal(40.0, 5.0))
-            speed = max(0.0, speed)
+            # Reported speed: the vehicle's true speed plus small sensor jitter
+            speed = max(0.0, float(rng.normal(speed_kmh, 2.0)))
 
-            ts = start_time + timedelta(seconds=i * 2 + vid * 200)
+            ts = trip_start + timedelta(seconds=float(t_i))
 
             records.append(
                 {
